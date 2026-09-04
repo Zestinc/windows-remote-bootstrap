@@ -14,6 +14,7 @@ $winctl = Join-Path $repoRoot 'winctl'
 $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $sshRoot = Join-Path $env:ProgramData 'ssh'
 $configPath = Join-Path $sshRoot 'sshd_config'
+$logsPath = Join-Path $sshRoot 'logs'
 $managedRoot = Join-Path $env:ProgramData 'WindowsRemoteBootstrap'
 $cleanupRoot = Join-Path $env:ProgramData '.WindowsRemoteBootstrap.cleanup'
 $managedRuleName = 'WindowsRemoteBootstrap-SSH-In'
@@ -132,6 +133,41 @@ function Get-ServiceTestSnapshot {
     }
 }
 
+function Get-SshdServiceSddl {
+    $sc = Join-Path $env:SystemRoot 'System32\sc.exe'
+    $output = @(& $sc sdshow sshd 2>&1)
+    $exitCode = $LASTEXITCODE
+    Assert-True ($exitCode -eq 0) "sc.exe sdshow sshd failed: $($output -join ' ')"
+    foreach ($line in @($output | ForEach-Object { ([string]$_).Trim() } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+        try {
+            [void](New-Object -TypeName Security.AccessControl.RawSecurityDescriptor `
+                    -ArgumentList (,$line))
+            return $line
+        } catch {
+        }
+    }
+    throw "sc.exe sdshow sshd did not return a parseable SDDL: $($output -join ' ')"
+}
+
+function Set-SshdServiceSddl {
+    param([Parameter(Mandatory = $true)][string]$Sddl)
+
+    $sc = Join-Path $env:SystemRoot 'System32\sc.exe'
+    $output = @(& $sc sdset sshd $Sddl 2>&1)
+    Assert-True ($LASTEXITCODE -eq 0) "sc.exe sdset sshd failed: $($output -join ' ')"
+}
+
+function Add-UnsafeUsersServiceAce {
+    param([Parameter(Mandatory = $true)][string]$Sddl)
+
+    # SERVICE_CHANGE_CONFIG (DC) plus SERVICE_START (RP) must never be
+    # granted to BUILTIN\Users. Insert it into the DACL, before any SACL.
+    $saclIndex = $Sddl.IndexOf('S:', [StringComparison]::Ordinal)
+    if ($saclIndex -lt 0) { return "$Sddl(A;;DCRP;;;BU)" }
+    return $Sddl.Insert($saclIndex, '(A;;DCRP;;;BU)')
+}
+
 function Canonical-Values {
     param($Value)
     return (@($Value | ForEach-Object { [string]$_ } | Sort-Object -Unique) -join ',')
@@ -242,6 +278,59 @@ function Assert-AuditCheck {
     $check = @($Receipt.checks | Where-Object { [string]$_.name -eq $Name })
     Assert-True ($check.Count -eq 1) "Audit check '$Name' is missing or duplicated"
     Assert-Equal $Expected ([bool]$check[0].ok) "Audit check '$Name'"
+}
+
+function Assert-FreshHostKeySetAndLogs {
+    param([Parameter(Mandatory = $true)]$State)
+
+    $generated = @($State.generatedHostKeyFiles)
+    Assert-True (($generated.Count -ge 6) -and (($generated.Count % 2) -eq 0)) `
+        'fresh install did not record a complete default host-key set'
+
+    $generatedNames = @($generated | ForEach-Object { [string]$_.name })
+    $uniqueGeneratedNames = @($generatedNames | Sort-Object -Unique)
+    Assert-Equal $generated.Count $uniqueGeneratedNames.Count `
+        'fresh install recorded duplicate host-key filenames'
+
+    $types = New-Object System.Collections.ArrayList
+    foreach ($name in $generatedNames) {
+        $match = [regex]::Match($name, '^ssh_host_([a-z0-9][a-z0-9_-]{0,31})_key(?:\.pub)?$')
+        Assert-True $match.Success "fresh install recorded an invalid host-key filename: $name"
+        if (-not $types.Contains([string]$match.Groups[1].Value)) {
+            [void]$types.Add([string]$match.Groups[1].Value)
+        }
+    }
+    $typeSet = @($types | Sort-Object) -join ','
+    Assert-True ($typeSet -in @('ecdsa,ed25519,rsa', 'dsa,ecdsa,ed25519,rsa')) `
+        "fresh install recorded an unsupported default host-key set: $typeSet"
+    foreach ($type in @($types)) {
+        Assert-True (($generatedNames -ccontains "ssh_host_$($type)_key") -and
+            ($generatedNames -ccontains "ssh_host_$($type)_key.pub")) `
+            "fresh install did not record a complete $type host-key pair"
+    }
+
+    $actualItems = @(Get-ChildItem -LiteralPath $sshRoot -Filter 'ssh_host_*' -Force -ErrorAction Stop)
+    Assert-True (@($actualItems | Where-Object { $_.PSIsContainer }).Count -eq 0) `
+        'fresh install created a host-key-shaped directory'
+    $actualNames = @($actualItems | ForEach-Object { [string]$_.Name } | Sort-Object)
+    Assert-Equal (($generatedNames | Sort-Object) -join ',') ($actualNames -join ',') `
+        'fresh install state does not exactly own the actual host-key file set'
+    foreach ($record in $generated) {
+        $path = Join-Path $sshRoot ([string]$record.name)
+        Assert-Equal ([string]$record.sha256) `
+            ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()) `
+            "fresh install host-key hash differs from state: $([string]$record.name)"
+    }
+
+    Assert-True (Test-Path -LiteralPath $logsPath -PathType Container) `
+        'fresh install did not create the OpenSSH logs directory'
+    $logsItem = Get-Item -LiteralPath $logsPath -Force
+    Assert-True (($logsItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) `
+        'fresh install logs directory is a reparse point'
+    Assert-True (@(Get-ChildItem -LiteralPath $logsPath -Force -ErrorAction Stop).Count -eq 0) `
+        'fresh install logs directory is not empty'
+    Assert-Equal (Get-Acl -LiteralPath $sshRoot).Sddl (Get-Acl -LiteralPath $logsPath).Sddl `
+        'fresh install logs directory does not have the exact managed directory ACL'
 }
 
 function ConvertTo-MsysPath {
@@ -372,6 +461,10 @@ function Initialize-Fixture {
     if (-not (Test-Path -LiteralPath $sshRoot -PathType Container)) {
         [void](New-Item -Path $sshRoot -ItemType Directory)
     }
+    if (-not (Test-Path -LiteralPath $logsPath -PathType Container)) {
+        [void](New-Item -Path $logsPath -ItemType Directory)
+    }
+    Set-TestExactAcl -Path $logsPath -Directory $true
     & $keygen -A | Out-Null
     Assert-True ($LASTEXITCODE -eq 0) 'failed to generate baseline OpenSSH keys'
     foreach ($keyFile in @(Get-ChildItem -LiteralPath $sshRoot -Filter 'ssh_host_*' -File -Force)) {
@@ -451,6 +544,26 @@ try {
             0 'already-uninstalled' 'pre-transaction root direct cleanup'
         Assert-BaselineExact -Expected $baseline -Context 'pre-transaction root recovery'
 
+        $crashedHostKeyProbe = Invoke-InstallerRaw -Arguments $installArguments `
+            -CrashAfter 'host-key-probe'
+        Assert-True (($crashedHostKeyProbe.ExitCode -ne 0) -and
+            (-not $crashedHostKeyProbe.ReceiptExists)) `
+            'host-key probe hard crash did not terminate cleanly'
+        $probeTransactionPath = Join-Path $managedRoot 'transaction.json'
+        Assert-True (Test-Path -LiteralPath $probeTransactionPath -PathType Leaf) `
+            'host-key probe hard crash lost its transaction'
+        $probeTransaction = Get-Content -LiteralPath $probeTransactionPath -Raw | ConvertFrom-Json
+        Assert-Equal 'host-key-staging' ([string]$probeTransaction.phase) `
+            'host-key probe crash transaction phase'
+        $probeRoot = Join-Path $managedRoot `
+            "host-key-probe.$([string]$probeTransaction.transactionId)"
+        Assert-True ((Test-Path -LiteralPath $probeRoot -PathType Container) -and
+            (@(Get-ChildItem -LiteralPath $probeRoot -Recurse -Force -ErrorAction Stop).Count -gt 0)) `
+            'host-key probe hard crash did not preserve the protected probe tree'
+        Assert-Result (Invoke-InstallerRaw -Arguments @('-Mode', 'Uninstall')) `
+            0 'rolled-back-incomplete-install' 'host-key probe crash direct uninstall'
+        Assert-BaselineExact -Expected $baseline -Context 'host-key probe crash recovery'
+
         foreach ($stage in @('account-before-sid-journal', 'service')) {
             $failed = Invoke-InstallerRaw -Arguments $installArguments -ThrowAfter $stage
             Assert-Result $failed 1 'failed' "throw recovery $stage"
@@ -528,6 +641,22 @@ try {
         Set-PathSnapshot -Path $configPath -Snapshot $configSnapshot
 
         $state = Get-Content -LiteralPath (Join-Path $managedRoot 'state.json') -Raw | ConvertFrom-Json
+
+        $originalServiceSddl = Get-SshdServiceSddl
+        $unsafeServiceSddl = Add-UnsafeUsersServiceAce -Sddl $originalServiceSddl
+        try {
+            Set-SshdServiceSddl -Sddl $unsafeServiceSddl
+            Assert-True ((Get-SshdServiceSddl) -ne $originalServiceSddl) `
+                'sshd service DACL tamper was not applied'
+            $serviceAclDrift = Invoke-InstallerRaw -Arguments @('-Mode', 'Audit')
+            Assert-Result $serviceAclDrift 2 'drift' 'sshd service DACL tamper audit'
+            Assert-AuditCheck $serviceAclDrift.Receipt 'sshd-service-security' $false
+        } finally {
+            Set-SshdServiceSddl -Sddl $originalServiceSddl
+            Assert-Equal $originalServiceSddl (Get-SshdServiceSddl) `
+                'sshd service DACL was not restored exactly after tamper test'
+        }
+
         $privateHostKey = Join-Path $sshRoot 'ssh_host_ed25519_key'
         $privateAcl = Get-Acl -LiteralPath $privateHostKey
         $usersSid = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')
@@ -579,6 +708,9 @@ try {
         try {
             $freshInstall = Invoke-InstallerRaw -Arguments $installArguments
             Assert-Result $freshInstall 0 'installed' 'absent-directory install'
+            $freshState = Get-Content -LiteralPath (Join-Path $managedRoot 'state.json') -Raw |
+                ConvertFrom-Json
+            Assert-FreshHostKeySetAndLogs -State $freshState
             Test-SshSession
             Assert-Result (Invoke-InstallerRaw -Arguments @('-Mode', 'Audit')) `
                 0 'compliant' 'absent-directory audit'

@@ -22,6 +22,8 @@ $required = @(
     "WINDOWS_REMOTE_BOOTSTRAP_RECEIPT_JSON=",
     '$keygen -y -f $path',
     "Set-ExactAcl",
+    "QueryServiceObjectSecurity",
+    '$keygen -A',
     "AllowBypass",
     "Language.NullString]::Value"
 )

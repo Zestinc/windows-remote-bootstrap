@@ -34,9 +34,11 @@ $script:TransactionPath = Join-Path $script:RootPath 'transaction.json'
 $script:KeyPath = Join-Path $script:RootPath 'authorized_keys'
 $script:SshPath = Join-Path $script:ProgramDataPath 'ssh'
 $script:SshConfigPath = Join-Path $script:SshPath 'sshd_config'
+$script:SshLogsPath = Join-Path $script:SshPath 'logs'
 $script:SshOwnershipMarkerName = '.WindowsRemoteBootstrap.owner'
 $script:GlobalBegin = '# BEGIN WINDOWS-REMOTE-BOOTSTRAP MANAGED CONFIG'
 $script:GlobalEnd = '# END WINDOWS-REMOTE-BOOTSTRAP MANAGED CONFIG'
+$script:ManagedHostKeyTypes = @('dsa', 'rsa', 'ecdsa', 'ed25519')
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:InstallPhases = @(
     'created',
@@ -426,10 +428,80 @@ function Test-TrustedAdministrativeSid {
     }
 }
 
+function Test-FixedTrustedSystemSid {
+    param([Parameter(Mandatory = $true)][string]$Sid)
+    return $Sid -in @(
+        'S-1-5-18',       # LocalSystem
+        'S-1-5-32-544',   # Builtin Administrators
+        # NT SERVICE\TrustedInstaller
+        'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
+    )
+}
+
+function Test-TrustedSidForSecurityBoundary {
+    param(
+        [Parameter(Mandatory = $true)][string]$Sid,
+        [bool]$FixedTrustedOnly = $false
+    )
+
+    if ($FixedTrustedOnly) {
+        return Test-FixedTrustedSystemSid -Sid $Sid
+    }
+    return Test-TrustedAdministrativeSid -Sid $Sid
+}
+
+function ConvertTo-UnsignedAccessMask {
+    param([Parameter(Mandatory = $true)][int]$AccessMask)
+
+    # AccessMask is exposed as a signed Int32 in Windows PowerShell 5.1.
+    # Preserve its raw 32 bits so generic access flags cannot be hidden by a
+    # signed conversion or by FileSystemRights enum projection.
+    return [int64][BitConverter]::ToUInt32(
+        [BitConverter]::GetBytes($AccessMask), 0)
+}
+
+function Test-RawFileSystemAllowAces {
+    param(
+        [Parameter(Mandatory = $true)]$Descriptor,
+        [Parameter(Mandatory = $true)][int64]$UnsafeMask,
+        [bool]$FixedTrustedOnly = $false
+    )
+
+    if (($Descriptor.ControlFlags -band
+            [Security.AccessControl.ControlFlags]::DiscretionaryAclPresent) -eq 0 -or
+        ($null -eq $Descriptor.DiscretionaryAcl)) {
+        return $false
+    }
+    foreach ($ace in $Descriptor.DiscretionaryAcl) {
+        if (($ace.AceFlags -band [Security.AccessControl.AceFlags]::InheritOnly) -ne 0) {
+            continue
+        }
+        if (($ace -isnot [Security.AccessControl.CommonAce]) -or $ace.IsCallback) {
+            return $false
+        }
+        if ($ace.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessDenied) {
+            continue
+        }
+        if ($ace.AceQualifier -ne [Security.AccessControl.AceQualifier]::AccessAllowed) {
+            return $false
+        }
+        $sid = $null
+        try { $sid = [string]$ace.SecurityIdentifier.Value } catch { return $false }
+        if ([string]::IsNullOrWhiteSpace($sid)) { return $false }
+        if (Test-TrustedSidForSecurityBoundary -Sid $sid -FixedTrustedOnly $FixedTrustedOnly) {
+            continue
+        }
+        $mask = ConvertTo-UnsignedAccessMask -AccessMask ([int]$ace.AccessMask)
+        if (($mask -band $UnsafeMask) -ne 0) { return $false }
+    }
+    return $true
+}
+
 function Test-PathProtectedFromUntrustedMutation {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [bool]$DenyUntrustedRead = $false
+        [bool]$DenyUntrustedRead = $false,
+        [bool]$FixedTrustedOnly = $false
     )
 
     if ((-not (Test-Path -LiteralPath $Path)) -or (Test-ReparsePoint -Path $Path)) {
@@ -438,46 +510,33 @@ function Test-PathProtectedFromUntrustedMutation {
     try {
         $acl = Get-Acl -LiteralPath $Path
         $raw = New-Object -TypeName Security.AccessControl.RawSecurityDescriptor -ArgumentList (,$acl.Sddl)
-        if ($null -eq $raw.DiscretionaryAcl) { return $false }
         $ownerSid = ConvertTo-SidValue -IdentityReference $acl.Owner
         if ([string]::IsNullOrWhiteSpace($ownerSid) -or
-            (-not (Test-TrustedAdministrativeSid -Sid $ownerSid))) {
+            (-not (Test-TrustedSidForSecurityBoundary -Sid $ownerSid `
+                    -FixedTrustedOnly $FixedTrustedOnly))) {
             return $false
         }
 
-        $mutationRights =
-            [Security.AccessControl.FileSystemRights]::WriteData -bor
-            [Security.AccessControl.FileSystemRights]::AppendData -bor
-            [Security.AccessControl.FileSystemRights]::WriteExtendedAttributes -bor
-            [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
-            [Security.AccessControl.FileSystemRights]::WriteAttributes -bor
-            [Security.AccessControl.FileSystemRights]::Delete -bor
-            [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
-            [Security.AccessControl.FileSystemRights]::TakeOwnership
-        $unsafeRights = $mutationRights
-        if ($DenyUntrustedRead) {
-            $unsafeRights = $unsafeRights -bor [Security.AccessControl.FileSystemRights]::ReadData
+        # Untrusted principals may read/execute ordinary protected inputs, but
+        # every write/delete/security/future bit is rejected. Private host
+        # keys additionally reject ReadData and GENERIC_READ.
+        $unsafeMask = if ($DenyUntrustedRead) {
+            [int64]3756916567 # 0xdfedff57 = ~0x201200a8
+        } else {
+            [int64]1609432918 # 0x5fedff56 = ~0xa01200a9
         }
-        foreach ($rule in @($acl.Access)) {
-            if ([string]$rule.AccessControlType -ne 'Allow') { continue }
-            if (($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) {
-                continue
-            }
-            if (($rule.FileSystemRights -band $unsafeRights) -eq 0) { continue }
-            $ruleSid = ConvertTo-SidValue -IdentityReference $rule.IdentityReference
-            if ([string]::IsNullOrWhiteSpace($ruleSid) -or
-                (-not (Test-TrustedAdministrativeSid -Sid $ruleSid))) {
-                return $false
-            }
-        }
-        return $true
+        return Test-RawFileSystemAllowAces -Descriptor $raw -UnsafeMask $unsafeMask `
+            -FixedTrustedOnly $FixedTrustedOnly
     } catch {
         return $false
     }
 }
 
 function Test-ParentProtectsChildFromUntrustedReplacement {
-    param([Parameter(Mandatory = $true)][string]$ChildPath)
+    param(
+        [Parameter(Mandatory = $true)][string]$ChildPath,
+        [bool]$FixedTrustedOnly = $false
+    )
 
     $parent = Split-Path -Parent $ChildPath
     if ((-not (Test-Path -LiteralPath $parent -PathType Container)) -or
@@ -487,30 +546,77 @@ function Test-ParentProtectsChildFromUntrustedReplacement {
     try {
         $acl = Get-Acl -LiteralPath $parent
         $raw = New-Object -TypeName Security.AccessControl.RawSecurityDescriptor -ArgumentList (,$acl.Sddl)
-        if ($null -eq $raw.DiscretionaryAcl) { return $false }
         $ownerSid = ConvertTo-SidValue -IdentityReference $acl.Owner
         if ([string]::IsNullOrWhiteSpace($ownerSid) -or
-            (-not (Test-TrustedAdministrativeSid -Sid $ownerSid))) {
+            (-not (Test-TrustedSidForSecurityBoundary -Sid $ownerSid `
+                    -FixedTrustedOnly $FixedTrustedOnly))) {
             return $false
         }
-        $replacementRights =
-            [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
-            [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
-            [Security.AccessControl.FileSystemRights]::TakeOwnership
-        foreach ($rule in @($acl.Access)) {
-            if ([string]$rule.AccessControlType -ne 'Allow') { continue }
-            if (($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
-            if (($rule.FileSystemRights -band $replacementRights) -eq 0) { continue }
-            $ruleSid = ConvertTo-SidValue -IdentityReference $rule.IdentityReference
-            if ([string]::IsNullOrWhiteSpace($ruleSid) -or
-                (-not (Test-TrustedAdministrativeSid -Sid $ruleSid))) {
+        # A parent may allow an untrusted user to create unrelated siblings;
+        # it must not allow deleting/replacing this child or rewriting the
+        # parent's security. Include generic write/all explicitly.
+        $unsafeReplacementMask = [int64]1343029312 # 0x500d0040
+        return Test-RawFileSystemAllowAces -Descriptor $raw `
+            -UnsafeMask $unsafeReplacementMask -FixedTrustedOnly $FixedTrustedOnly
+    } catch {
+        return $false
+    }
+}
+
+function Test-ProtectedPathIdentityChain {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    try {
+        $current = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        while ($null -ne $current.Parent) {
+            $acl = Get-Acl -LiteralPath $current.FullName -ErrorAction Stop
+            $raw = New-Object -TypeName Security.AccessControl.RawSecurityDescriptor `
+                -ArgumentList (,$acl.Sddl)
+            $ownerSid = ConvertTo-SidValue -IdentityReference $acl.Owner
+            if ([string]::IsNullOrWhiteSpace($ownerSid) -or
+                (-not (Test-FixedTrustedSystemSid -Sid $ownerSid))) {
                 return $false
             }
+            # The object itself cannot be deleted or have ownership/DACL
+            # rewritten; generic write/all also fail closed.
+            if (-not (Test-RawFileSystemAllowAces -Descriptor $raw `
+                    -UnsafeMask ([int64]1343029248) -FixedTrustedOnly $true)) { # 0x500d0000
+                return $false
+            }
+            if (-not (Test-ParentProtectsChildFromUntrustedReplacement `
+                    -ChildPath $current.FullName -FixedTrustedOnly $true)) {
+                return $false
+            }
+            $current = $current.Parent
         }
         return $true
     } catch {
         return $false
     }
+}
+
+function Test-SshLogsDirectoryProtected {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [bool]$RequireEmpty = $false,
+        [bool]$ManagedExact = $false
+    )
+
+    if ((-not (Test-Path -LiteralPath $Path -PathType Container)) -or
+        (Test-ReparsePoint -Path $Path) -or
+        (-not (Test-PathProtectedFromUntrustedMutation -Path $Path)) -or
+        (-not (Test-ParentProtectsChildFromUntrustedReplacement -ChildPath $Path))) {
+        return $false
+    }
+    if ($ManagedExact -and (-not (Test-ManagedDirectoryAcl -Path $Path))) { return $false }
+    if ($RequireEmpty) {
+        try {
+            return @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop).Count -eq 0
+        } catch {
+            return $false
+        }
+    }
+    return $true
 }
 
 function Assert-SafeExistingSshBaseline {
@@ -524,6 +630,9 @@ function Assert-SafeExistingSshBaseline {
     $markerPath = Join-Path $script:SshPath $script:SshOwnershipMarkerName
     if (Test-Path -LiteralPath $markerPath) {
         throw 'The reserved OpenSSH ownership marker already exists without trusted installer state.'
+    }
+    if (-not (Test-SshLogsDirectoryProtected -Path $script:SshLogsPath)) {
+        throw 'The existing OpenSSH logs directory is missing, writable, or not a regular protected directory.'
     }
     $protectedInputs = @()
     if (Test-Path -LiteralPath $script:SshConfigPath) {
@@ -542,6 +651,9 @@ function Assert-SafeExistingSshBaseline {
     $protectedInputs += $hostKeyInputs
     foreach ($item in $protectedInputs) {
         $privateHostKey = ([string]$item.Name -match '^ssh_host_[A-Za-z0-9._-]+_key$')
+        if ($privateHostKey -and ([int64]$item.Length -le 0)) {
+            throw "An existing private host key is empty and would be replaced by ssh-keygen -A: $($item.FullName)"
+        }
         if ((Test-ReparsePoint -Path $item.FullName) -or
             (-not (Test-PathProtectedFromUntrustedMutation -Path $item.FullName -DenyUntrustedRead $privateHostKey))) {
             throw "An existing OpenSSH security input is writable or owned by an untrusted principal: $($item.FullName)"
@@ -585,7 +697,10 @@ function Test-SshDirectoryBoundary {
     if ((-not (Test-Path -LiteralPath $script:SshPath -PathType Container)) -or
         (Test-ReparsePoint -Path $script:SshPath) -or
         (-not (Test-ParentProtectsChildFromUntrustedReplacement -ChildPath $script:SshPath)) -or
-        (-not (Test-SshOwnershipMarker -Record $Record))) {
+        (-not (Test-SshOwnershipMarker -Record $Record)) -or
+        (-not (Test-SshLogsDirectoryProtected -Path $script:SshLogsPath `
+                -RequireEmpty (-not [bool]$Record.original.sshDirectory.existed) `
+                -ManagedExact (-not [bool]$Record.original.sshDirectory.existed)))) {
         return $false
     }
     if ([bool]$Record.original.sshDirectory.existed) {
@@ -662,9 +777,12 @@ function Establish-SshDirectoryBoundary {
         [void](New-Item -Path $candidatePath -ItemType Directory)
         Set-ExactAcl -Path $candidatePath -AllowedSids @('S-1-5-18', 'S-1-5-32-544') -Directory $true
         $candidateMarker = Join-Path $candidatePath $script:SshOwnershipMarkerName
+        $candidateLogs = Join-Path $candidatePath 'logs'
+        New-ManagedDirectoryProtectedAtCreation -Path $candidateLogs
         [IO.File]::WriteAllText($candidateMarker, [string]$Transaction.accountMarker, $script:Utf8NoBom)
         Protect-ManagedFile -Path $candidateMarker
         if ((-not (Test-ManagedDirectoryAcl -Path $candidatePath)) -or
+            (-not (Test-SshLogsDirectoryProtected -Path $candidateLogs -RequireEmpty $true -ManagedExact $true)) -or
             ((Get-FileSha256 -Path $candidateMarker) -ne [string]$Transaction.sshDirectoryMarkerSha256)) {
             throw 'The protected OpenSSH directory candidate failed validation.'
         }
@@ -675,10 +793,13 @@ function Establish-SshDirectoryBoundary {
             (-not (Test-ReparsePoint -Path $candidatePath)) -and
             (Test-ManagedDirectoryAcl -Path $candidatePath)) {
             $candidateMarker = Join-Path $candidatePath $script:SshOwnershipMarkerName
+            $candidateLogs = Join-Path $candidatePath 'logs'
             if ((Test-Path -LiteralPath $candidateMarker -PathType Leaf) -and
                 ((Get-FileSha256 -Path $candidateMarker) -eq [string]$Transaction.sshDirectoryMarkerSha256) -and
-                (@(Get-ChildItem -LiteralPath $candidatePath -Force).Count -eq 1)) {
+                (Test-SshLogsDirectoryProtected -Path $candidateLogs -RequireEmpty $true -ManagedExact $true) -and
+                (@(Get-ChildItem -LiteralPath $candidatePath -Force).Count -eq 2)) {
                 Remove-Item -LiteralPath $candidateMarker -Force
+                [IO.Directory]::Delete($candidateLogs, $false)
                 Remove-Item -LiteralPath $candidatePath -Force
             }
         }
@@ -1078,20 +1199,54 @@ function Test-EffectiveSshPolicy {
         (@($lines | Where-Object { $_ -like 'authorizedkeysfile *' }).Count -eq 1)
 }
 
+function Test-ProtectedSystemExecutable {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    try {
+        $actual = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+        $systemRoot = [IO.Path]::GetFullPath($script:SystemPath).TrimEnd('\') + '\'
+        if (-not $actual.StartsWith($systemRoot, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+        if ((-not (Test-Path -LiteralPath $actual -PathType Leaf)) -or
+            (Test-ReparsePoint -Path $actual)) { return $false }
+        Assert-NoReparseAncestors -Path $actual
+        if (-not (Test-ProtectedPathIdentityChain -Path $actual)) { return $false }
+
+        $directory = Split-Path -Parent $actual
+        if ((-not (Test-Path -LiteralPath $directory -PathType Container)) -or
+            (Test-ReparsePoint -Path $directory) -or
+            (-not (Test-PathProtectedFromUntrustedMutation -Path $directory -FixedTrustedOnly $true)) -or
+            (-not (Test-ParentProtectsChildFromUntrustedReplacement -ChildPath $directory -FixedTrustedOnly $true)) -or
+            (-not (Test-PathProtectedFromUntrustedMutation -Path $actual -FixedTrustedOnly $true)) -or
+            (-not (Test-ParentProtectsChildFromUntrustedReplacement -ChildPath $actual -FixedTrustedOnly $true))) {
+            return $false
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 function Get-SshdExecutable {
     $candidate = Join-Path $script:SystemPath 'OpenSSH\sshd.exe'
-    if (-not (Test-Path -LiteralPath $candidate)) {
-        throw "OpenSSH Server executable was not found at $candidate."
+    if (-not (Test-ProtectedSystemExecutable -Path $candidate)) {
+        throw "OpenSSH Server executable is missing or has an unsafe path/ACL: $candidate"
     }
     return $candidate
 }
 
 function Get-SshKeygenExecutable {
     $candidate = Join-Path $script:SystemPath 'OpenSSH\ssh-keygen.exe'
-    if (-not (Test-Path -LiteralPath $candidate)) {
-        throw "OpenSSH key utility was not found at $candidate."
+    if (-not (Test-ProtectedSystemExecutable -Path $candidate)) {
+        throw "OpenSSH key utility is missing or has an unsafe path/ACL: $candidate"
     }
     return $candidate
+}
+
+function Get-ManagedHostKeyNames {
+    return @($script:ManagedHostKeyTypes | ForEach-Object {
+            "ssh_host_$($_)_key"
+            "ssh_host_$($_)_key.pub"
+        })
 }
 
 function Get-PlannedHostKeyStagePath {
@@ -1100,11 +1255,133 @@ function Get-PlannedHostKeyStagePath {
         [Parameter(Mandatory = $true)][string]$Name
     )
 
-    if ($Name -notin @('ssh_host_ed25519_key', 'ssh_host_ed25519_key.pub')) {
+    $allowedNames = @(Get-ManagedHostKeyNames)
+    if ($Name -notin $allowedNames) {
         throw "Unexpected planned host-key filename: $Name"
     }
-    $suffix = if ($Name -eq 'ssh_host_ed25519_key.pub') { 'ssh_host_ed25519_key.staged.pub' } else { 'ssh_host_ed25519_key.staged' }
+    $privateName = if ($Name.EndsWith('.pub', [StringComparison]::Ordinal)) {
+        $Name.Substring(0, $Name.Length - 4)
+    } else { $Name }
+    $suffix = if ($Name.EndsWith('.pub', [StringComparison]::Ordinal)) {
+        "$privateName.staged.pub"
+    } else { "$privateName.staged" }
     return Join-Path $script:RootPath ("host-key.$($Transaction.transactionId).$suffix")
+}
+
+function Get-HostKeyProbeRootPath {
+    param([Parameter(Mandatory = $true)]$Transaction)
+    return Join-Path $script:RootPath ("host-key-probe.$($Transaction.transactionId)")
+}
+
+function Get-HostKeyProbeLayout {
+    param([Parameter(Mandatory = $true)]$Transaction)
+
+    $root = Get-HostKeyProbeRootPath -Transaction $Transaction
+    $prefix = Join-Path $root 'prefix.'
+    $prefixedProgramData = "${prefix}__PROGRAMDATA__"
+    $fallbackProgramData = Join-Path $root 'fallback'
+    return [pscustomobject]@{
+        Root = $root
+        Prefix = $prefix
+        PrefixedProgramData = $prefixedProgramData
+        PrefixedSsh = Join-Path $prefixedProgramData 'ssh'
+        FallbackProgramData = $fallbackProgramData
+        FallbackSsh = Join-Path $fallbackProgramData 'ssh'
+    }
+}
+
+function Assert-HostKeyProbeTreeProtected {
+    param([Parameter(Mandatory = $true)]$Transaction)
+
+    $layout = Get-HostKeyProbeLayout -Transaction $Transaction
+    if (-not (Test-Path -LiteralPath $layout.Root)) { return }
+    if ((-not (Test-Path -LiteralPath $layout.Root -PathType Container)) -or
+        (Test-ReparsePoint -Path $layout.Root) -or
+        (-not (Test-ManagedDirectoryAcl -Path $layout.Root)) -or
+        (-not (Test-ParentProtectsChildFromUntrustedReplacement -ChildPath $layout.Root))) {
+        throw 'The protected host-key probe root changed identity.'
+    }
+    foreach ($item in @(Get-ChildItem -LiteralPath $layout.Root -Recurse -Force -ErrorAction Stop)) {
+        if (Test-ReparsePoint -Path $item.FullName) {
+            throw "The host-key probe contains a reparse point: $($item.FullName)"
+        }
+        if ($item.PSIsContainer) {
+            if (-not (Test-ManagedDirectoryAcl -Path $item.FullName)) {
+                throw "The host-key probe contains an unprotected directory: $($item.FullName)"
+            }
+        } else {
+            $publicOnly = [string]$item.Name -match '\.pub(?:\.[A-Za-z0-9]+)?$'
+            if (Test-PathProtectedFromUntrustedMutation -Path $item.FullName `
+                    -DenyUntrustedRead (-not $publicOnly)) { continue }
+            # An interrupted ssh-keygen may leave a randomly suffixed private
+            # temporary file. Treat everything except public-key forms as
+            # confidential.
+            throw "The host-key probe contains an unprotected file: $($item.FullName)"
+        }
+    }
+}
+
+function Remove-HostKeyProbeTree {
+    param([Parameter(Mandatory = $true)]$Transaction)
+
+    $root = Get-HostKeyProbeRootPath -Transaction $Transaction
+    if (-not (Test-Path -LiteralPath $root)) { return }
+    Assert-HostKeyProbeTreeProtected -Transaction $Transaction
+    Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop
+}
+
+function Get-ProbeHostKeyRecords {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $records = New-Object System.Collections.ArrayList
+    foreach ($item in @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop | Sort-Object Name)) {
+        $nameMatch = [regex]::Match([string]$item.Name,
+            '^ssh_host_([a-z0-9][a-z0-9_-]{0,31})_key(?:\.pub)?$',
+            [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+        if ($item.PSIsContainer -or (Test-ReparsePoint -Path $item.FullName) -or
+            (-not $nameMatch.Success) -or
+            (-not (Test-PathProtectedFromUntrustedMutation -Path $item.FullName `
+                    -DenyUntrustedRead (-not ([string]$item.Name).EndsWith('.pub', [StringComparison]::Ordinal)))) -or
+            ([int64]$item.Length -le 0)) {
+            throw "The host-key probe produced an unsafe or unexpected path: $($item.FullName)"
+        }
+        [void]$records.Add([ordered]@{
+                name = [string]$item.Name
+                type = [string]$nameMatch.Groups[1].Value
+                sha256 = Get-FileSha256 -Path $item.FullName
+                path = [string]$item.FullName
+            })
+    }
+    return @($records)
+}
+
+function Test-ProbeHostKeyPair {
+    param(
+        [Parameter(Mandatory = $true)][string]$PrivatePath,
+        [Parameter(Mandatory = $true)][string]$PublicPath,
+        [Parameter(Mandatory = $true)][string]$SshKeygen
+    )
+
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $derivedOutput = @(& $SshKeygen -y -f $PrivatePath 2>&1)
+        $derivedExit = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    if ($derivedExit -ne 0) { return $false }
+    $derivedLines = @($derivedOutput | ForEach-Object { ([string]$_).Trim() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $publicLines = @(Get-Content -LiteralPath $PublicPath -ErrorAction Stop |
+        ForEach-Object { ([string]$_).Trim() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if (($derivedLines.Count -ne 1) -or ($publicLines.Count -ne 1)) { return $false }
+    $derivedParts = @($derivedLines[0] -split '\s+', 3)
+    $publicParts = @($publicLines[0] -split '\s+', 3)
+    return ($derivedParts.Count -ge 2) -and ($publicParts.Count -ge 2) -and
+        ([string]$derivedParts[0] -ceq [string]$publicParts[0]) -and
+        ([string]$derivedParts[1] -ceq [string]$publicParts[1])
 }
 
 function Get-AuthorizedKeysStagePath {
@@ -1160,50 +1437,129 @@ function Prepare-PlannedHostKeyFiles {
     param([Parameter(Mandatory = $true)]$Transaction)
 
     Assert-OriginalHostKeysUnchanged -Records @($Transaction.original.hostKeyFiles)
-    $privateName = 'ssh_host_ed25519_key'
-    $publicName = 'ssh_host_ed25519_key.pub'
-    $originalNames = @($Transaction.original.hostKeyFiles | ForEach-Object { ([string]$_.name).ToLowerInvariant() })
-    if ($originalNames -contains $privateName) {
-        $Transaction.plannedHostKeyFiles = @()
-        Update-InstallTransaction -Transaction $Transaction
-        return
+    $layout = Get-HostKeyProbeLayout -Transaction $Transaction
+    if (Test-Path -LiteralPath $layout.Root) {
+        throw 'The deterministic host-key probe path already exists.'
     }
-    if ($originalNames -contains $publicName) {
-        throw 'An orphaned original Ed25519 public host key exists without its private key.'
-    }
-    foreach ($name in @($privateName, $publicName)) {
-        $destination = Join-Path $script:SshPath $name
-        if (Test-Path -LiteralPath $destination) {
-            throw "An unplanned host-key destination appeared: $destination"
+
+    New-ManagedDirectoryProtectedAtCreation -Path $layout.Root
+    New-ManagedDirectoryProtectedAtCreation -Path $layout.PrefixedProgramData
+    New-ManagedDirectoryProtectedAtCreation -Path $layout.PrefixedSsh
+    New-ManagedDirectoryProtectedAtCreation -Path $layout.FallbackProgramData
+    New-ManagedDirectoryProtectedAtCreation -Path $layout.FallbackSsh
+    Assert-HostKeyProbeTreeProtected -Transaction $Transaction
+
+    $keygen = Get-SshKeygenExecutable
+    $savedProgramData = [Environment]::GetEnvironmentVariable('ProgramData', 'Process')
+    try {
+        # -f is the documented ssh-keygen -A prefix. The process-only
+        # ProgramData override is a second containment boundary for older
+        # Windows builds that might ignore the prefix.
+        [Environment]::SetEnvironmentVariable('ProgramData', $layout.FallbackProgramData, 'Process')
+        $previousPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $firstOutput = @(& $keygen -A -f $layout.Prefix 2>&1)
+            $firstExit = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousPreference
         }
-        $stage = Get-PlannedHostKeyStagePath -Transaction $Transaction -Name $name
-        if (Test-Path -LiteralPath $stage) {
-            throw "A planned host-key staging path already exists: $stage"
+        if ($firstExit -ne 0) {
+            throw "OpenSSH default host-key generation failed: $($firstOutput -join ' ')"
+        }
+        Assert-OriginalHostKeysUnchanged -Records @($Transaction.original.hostKeyFiles)
+        Assert-HostKeyProbeTreeProtected -Transaction $Transaction
+        Invoke-TestHook -Stage 'host-key-probe'
+
+        $prefixedCount = @(Get-ChildItem -LiteralPath $layout.PrefixedSsh -Force -ErrorAction Stop).Count
+        $fallbackCount = @(Get-ChildItem -LiteralPath $layout.FallbackSsh -Force -ErrorAction Stop).Count
+        if (([int]($prefixedCount -gt 0) + [int]($fallbackCount -gt 0)) -ne 1) {
+            throw 'ssh-keygen did not produce one unambiguous protected default-key set.'
+        }
+        $sourcePath = if ($prefixedCount -gt 0) { $layout.PrefixedSsh } else { $layout.FallbackSsh }
+        $firstRecords = @(Get-ProbeHostKeyRecords -Path $sourcePath)
+
+        # A second run must be silent and byte-stable. ssh-keygen -A may
+        # return success even when one key type failed, but it always emits
+        # output while retrying a missing default key.
+        try {
+            $ErrorActionPreference = 'Continue'
+            $secondOutput = @(& $keygen -A -f $layout.Prefix 2>&1)
+            $secondExit = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousPreference
+        }
+        $nonEmptySecondOutput = @($secondOutput | Where-Object {
+                -not [string]::IsNullOrWhiteSpace(([string]$_).Trim())
+            })
+        $prefixedCountAfter = @(Get-ChildItem -LiteralPath $layout.PrefixedSsh -Force -ErrorAction Stop).Count
+        $fallbackCountAfter = @(Get-ChildItem -LiteralPath $layout.FallbackSsh -Force -ErrorAction Stop).Count
+        $secondRecords = @(Get-ProbeHostKeyRecords -Path $sourcePath)
+        if (($secondExit -ne 0) -or ($nonEmptySecondOutput.Count -ne 0) -or
+            ($prefixedCountAfter -ne $prefixedCount) -or
+            ($fallbackCountAfter -ne $fallbackCount) -or
+            (($firstRecords | ConvertTo-Json -Depth 4 -Compress) -ne
+                ($secondRecords | ConvertTo-Json -Depth 4 -Compress))) {
+            throw 'OpenSSH default host-key generation did not converge to a silent, byte-stable set.'
+        }
+        Assert-OriginalHostKeysUnchanged -Records @($Transaction.original.hostKeyFiles)
+    } finally {
+        [Environment]::SetEnvironmentVariable('ProgramData', $savedProgramData, 'Process')
+    }
+
+    $records = @(Get-ProbeHostKeyRecords -Path $sourcePath)
+    $types = @($records | ForEach-Object { [string]$_.type } | Sort-Object -Unique)
+    $typeSet = $types -join ','
+    if ($typeSet -notin @('ecdsa,ed25519,rsa', 'dsa,ecdsa,ed25519,rsa')) {
+        throw "OpenSSH produced an unsupported default host-key set: $typeSet"
+    }
+    foreach ($type in $types) {
+        $privateName = "ssh_host_$($type)_key"
+        $publicName = "$privateName.pub"
+        $private = @($records | Where-Object { [string]$_.name -ceq $privateName })
+        $public = @($records | Where-Object { [string]$_.name -ceq $publicName })
+        if (($private.Count -ne 1) -or ($public.Count -ne 1) -or
+            (-not (Test-ProbeHostKeyPair -PrivatePath ([string]$private[0].path) `
+                    -PublicPath ([string]$public[0].path) -SshKeygen $keygen))) {
+            throw "OpenSSH produced an incomplete or mismatched $type host-key pair."
         }
     }
 
-    $privateStage = Get-PlannedHostKeyStagePath -Transaction $Transaction -Name $privateName
-    $publicStage = "$privateStage.pub"
-    $expectedPublicStage = Get-PlannedHostKeyStagePath -Transaction $Transaction -Name $publicName
-    $keygen = Get-SshKeygenExecutable
-    $output = @(& $keygen -q -t ed25519 -N '""' -f $privateStage 2>&1)
-    if ($LASTEXITCODE -ne 0) {
-        throw "OpenSSH Ed25519 host key generation failed: $($output -join ' ')"
+    $originalNames = @($Transaction.original.hostKeyFiles | ForEach-Object {
+            ([string]$_.name).ToLowerInvariant()
+        })
+    foreach ($record in @($Transaction.original.hostKeyFiles)) {
+        $name = ([string]$record.name).ToLowerInvariant()
+        if (($name -match '^ssh_host_[a-z0-9][a-z0-9_-]{0,31}_key$') -and
+            ([int64](Get-Item -LiteralPath (Join-Path $script:SshPath $name) -Force).Length -le 0)) {
+            throw "An existing zero-length private host key would be replaced by ssh-keygen -A: $name"
+        }
+    }
+
+    $planned = New-Object System.Collections.ArrayList
+    foreach ($type in $types) {
+        $privateName = "ssh_host_$($type)_key"
+        $publicName = "$privateName.pub"
+        if ($originalNames -contains $privateName) { continue }
+        if ($originalNames -contains $publicName) {
+            throw "An orphaned original $type public host key exists without its private key."
+        }
+        foreach ($name in @($privateName, $publicName)) {
+            $destination = Join-Path $script:SshPath $name
+            $stage = Get-PlannedHostKeyStagePath -Transaction $Transaction -Name $name
+            if ((Test-Path -LiteralPath $destination) -or (Test-Path -LiteralPath $stage)) {
+                throw "A host-key destination or staging path appeared unexpectedly: $name"
+            }
+            $source = Join-Path $sourcePath $name
+            [IO.File]::Move($source, $stage)
+            Protect-ManagedFile -Path $stage
+            [void]$planned.Add((Get-ProtectedFileRecord -Path $stage -Name $name))
+        }
     }
     Invoke-TestHook -Stage 'hostkeys-before-journal'
-    if ($publicStage -ne $expectedPublicStage) {
-        if (Test-Path -LiteralPath $expectedPublicStage) {
-            throw 'The planned public host-key staging path unexpectedly exists.'
-        }
-        [IO.File]::Move($publicStage, $expectedPublicStage)
-    }
-    Protect-ManagedFile -Path $privateStage
-    Protect-ManagedFile -Path $expectedPublicStage
-    $Transaction.plannedHostKeyFiles = @(
-        Get-ProtectedFileRecord -Path $privateStage -Name $privateName
-        Get-ProtectedFileRecord -Path $expectedPublicStage -Name $publicName
-    )
+    $Transaction.plannedHostKeyFiles = @($planned)
     Update-InstallTransaction -Transaction $Transaction
+    Remove-HostKeyProbeTree -Transaction $Transaction
 }
 
 function Publish-PlannedHostKeyFiles {
@@ -1230,12 +1586,14 @@ function Publish-PlannedHostKeyFiles {
 function Remove-PlannedHostKeyStagingFiles {
     param([Parameter(Mandatory = $true)]$Transaction)
 
-    foreach ($name in @('ssh_host_ed25519_key', 'ssh_host_ed25519_key.pub')) {
+    $names = @(Get-ManagedHostKeyNames)
+    foreach ($name in $names) {
         $stage = Get-PlannedHostKeyStagePath -Transaction $Transaction -Name $name
         if (-not (Test-Path -LiteralPath $stage)) { continue }
         if ((Test-ReparsePoint -Path $stage) -or
             (-not (Test-Path -LiteralPath $stage -PathType Leaf)) -or
-            (-not (Test-PathProtectedFromUntrustedMutation -Path $stage -DenyUntrustedRead ($name -eq 'ssh_host_ed25519_key')))) {
+            (-not (Test-PathProtectedFromUntrustedMutation -Path $stage `
+                    -DenyUntrustedRead ($name -match '_key$')))) {
             throw "A host-key staging file changed identity; refusing to remove it: $stage"
         }
         $planned = @($Transaction.plannedHostKeyFiles | Where-Object { [string]$_.name -eq $name })
@@ -1244,6 +1602,7 @@ function Remove-PlannedHostKeyStagingFiles {
         }
         Remove-Item -LiteralPath $stage -Force
     }
+    Remove-HostKeyProbeTree -Transaction $Transaction
 }
 
 function Test-SshConfig {
@@ -1690,6 +2049,144 @@ function Get-SshdServiceOrNull {
     }
 }
 
+function Get-ServiceSecurityDescriptor {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    if ($null -eq ('WindowsRemoteBootstrap.NativeServiceSecurity' -as [type])) {
+        $source = @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+namespace WindowsRemoteBootstrap
+{
+    public static class NativeServiceSecurity
+    {
+        private const uint SC_MANAGER_CONNECT = 0x0001;
+        private const uint READ_CONTROL = 0x00020000;
+        private const uint OWNER_SECURITY_INFORMATION = 0x00000001;
+        private const uint DACL_SECURITY_INFORMATION = 0x00000004;
+        private const int ERROR_INSUFFICIENT_BUFFER = 122;
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern IntPtr OpenSCManager(
+            string machineName,
+            string databaseName,
+            uint desiredAccess);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern IntPtr OpenService(
+            IntPtr serviceManager,
+            string serviceName,
+            uint desiredAccess);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool QueryServiceObjectSecurity(
+            IntPtr service,
+            uint securityInformation,
+            byte[] securityDescriptor,
+            uint bufferSize,
+            out uint bytesNeeded);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseServiceHandle(IntPtr handle);
+
+        public static byte[] QueryOwnerAndDacl(string serviceName)
+        {
+            IntPtr manager = IntPtr.Zero;
+            IntPtr service = IntPtr.Zero;
+            try
+            {
+                manager = OpenSCManager(null, null, SC_MANAGER_CONNECT);
+                if (manager == IntPtr.Zero)
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "OpenSCManager failed");
+                service = OpenService(manager, serviceName, READ_CONTROL);
+                if (service == IntPtr.Zero)
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "OpenService failed");
+
+                uint needed;
+                bool first = QueryServiceObjectSecurity(
+                    service,
+                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                    null,
+                    0,
+                    out needed);
+                int firstError = Marshal.GetLastWin32Error();
+                if (first || needed == 0 || firstError != ERROR_INSUFFICIENT_BUFFER)
+                    throw new Win32Exception(firstError, "QueryServiceObjectSecurity sizing failed");
+
+                byte[] descriptor = new byte[needed];
+                if (!QueryServiceObjectSecurity(
+                    service,
+                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                    descriptor,
+                    (uint)descriptor.Length,
+                    out needed))
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "QueryServiceObjectSecurity failed");
+                return descriptor;
+            }
+            finally
+            {
+                if (service != IntPtr.Zero) CloseServiceHandle(service);
+                if (manager != IntPtr.Zero) CloseServiceHandle(manager);
+            }
+        }
+    }
+}
+'@
+        Add-Type -TypeDefinition $source -Language CSharp -ErrorAction Stop
+    }
+    return [WindowsRemoteBootstrap.NativeServiceSecurity]::QueryOwnerAndDacl($Name)
+}
+
+function Test-SshdServiceObjectSecurity {
+    try {
+        [byte[]]$bytes = Get-ServiceSecurityDescriptor -Name 'sshd'
+        $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($bytes, 0)
+        if (($null -eq $descriptor.Owner) -or
+            (-not (Test-FixedTrustedSystemSid -Sid ([string]$descriptor.Owner.Value))) -or
+            (($descriptor.ControlFlags -band
+                    [Security.AccessControl.ControlFlags]::DiscretionaryAclPresent) -eq 0) -or
+            ($null -eq $descriptor.DiscretionaryAcl)) {
+            return $false
+        }
+
+        # Non-administrative principals may query status/configuration and
+        # read the descriptor. Every mutation/control/future bit fails closed.
+        $unsafeForUntrusted = [int64]2147352178 # 0x7ffDFE72
+        foreach ($ace in $descriptor.DiscretionaryAcl) {
+            if (($ace -isnot [Security.AccessControl.CommonAce]) -or
+                $ace.IsCallback -or
+                ($ace.AceFlags -ne [Security.AccessControl.AceFlags]::None)) {
+                return $false
+            }
+            if ($ace.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessDenied) { continue }
+            if ($ace.AceQualifier -ne [Security.AccessControl.AceQualifier]::AccessAllowed) { return $false }
+            $sid = [string]$ace.SecurityIdentifier.Value
+            if (Test-FixedTrustedSystemSid -Sid $sid) { continue }
+            $mask = [int64][BitConverter]::ToUInt32(
+                [BitConverter]::GetBytes([int]$ace.AccessMask), 0)
+            if (($mask -band $unsafeForUntrusted) -ne 0) { return $false }
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Test-SshdServiceSecurityBoundary {
+    try {
+        if ($null -eq (Get-SshdServiceOrNull)) { return $false }
+        [void](Get-SshdExecutable)
+        [void](Get-SshKeygenExecutable)
+        return Test-SshdServiceObjectSecurity
+    } catch {
+        return $false
+    }
+}
+
 function Get-ServiceSnapshot {
     $record = Get-SshdServiceOrNull
     if ($null -eq $record) {
@@ -1719,8 +2216,8 @@ function Stop-SshdAndWait {
     $record = Get-SshdServiceOrNull
     if ($null -eq $record) { return }
     $service = $record.Controller
-    if (-not (Test-SshdServiceIdentity)) {
-        throw 'Refusing to stop sshd because its executable path or service identity changed.'
+    if ((-not (Test-SshdServiceIdentity)) -or (-not (Test-SshdServiceSecurityBoundary))) {
+        throw 'Refusing to stop sshd because its identity, service DACL, or binary boundary is unsafe.'
     }
     if ([string]$service.Status -ne 'Stopped') {
         Stop-Service -Name sshd -Force -ErrorAction Stop
@@ -1769,8 +2266,8 @@ function Restore-ServiceSnapshot {
     if ($null -eq $service) {
         throw 'Cannot restore the original sshd service because it is missing.'
     }
-    if (-not (Test-SshdServiceIdentity)) {
-        throw 'Cannot restore sshd because its executable path or service identity changed.'
+    if ((-not (Test-SshdServiceIdentity)) -or (-not (Test-SshdServiceSecurityBoundary))) {
+        throw 'Cannot restore sshd because its identity, service DACL, or binary boundary changed.'
     }
     $targetType = [string]$Snapshot.startType
     if ($targetType -eq 'Disabled') {
@@ -2026,6 +2523,25 @@ function Assert-HostKeyRecordsShape {
     }
 }
 
+function Assert-GeneratedHostKeyRecordPairs {
+    param([Parameter(Mandatory = $true)]$Records)
+
+    $names = @($Records | ForEach-Object { ([string]$_.name).ToLowerInvariant() })
+    $allowedNames = @(Get-ManagedHostKeyNames)
+    foreach ($name in $names) {
+        if ($name -notin $allowedNames) {
+            throw "A generated host-key record has an unsupported name: '$name'."
+        }
+    }
+    foreach ($type in $script:ManagedHostKeyTypes) {
+        $privatePresent = $names -contains "ssh_host_$($type)_key"
+        $publicPresent = $names -contains "ssh_host_$($type)_key.pub"
+        if ($privatePresent -ne $publicPresent) {
+            throw "A generated $type host-key record is missing its pair."
+        }
+    }
+}
+
 function Assert-SnapshotShape {
     param([Parameter(Mandatory = $true)]$Original)
 
@@ -2151,6 +2667,8 @@ function Assert-TransactionShape {
     }
     Assert-HostKeyRecordsShape -Records @($Transaction.plannedHostKeyFiles)
     Assert-HostKeyRecordsShape -Records @($Transaction.generatedHostKeyFiles)
+    Assert-GeneratedHostKeyRecordPairs -Records @($Transaction.plannedHostKeyFiles)
+    Assert-GeneratedHostKeyRecordPairs -Records @($Transaction.generatedHostKeyFiles)
     Assert-HostKeyRecordsShape -Records @(@($Transaction.original.hostKeyFiles) + @($Transaction.generatedHostKeyFiles))
 }
 
@@ -2185,7 +2703,13 @@ function Assert-StateShape {
     }
     Assert-SnapshotShape -Original $State.original
     Assert-HostKeyRecordsShape -Records @($State.generatedHostKeyFiles)
+    Assert-GeneratedHostKeyRecordPairs -Records @($State.generatedHostKeyFiles)
     Assert-HostKeyRecordsShape -Records @(@($State.original.hostKeyFiles) + @($State.generatedHostKeyFiles))
+    $hostKeyNames = @(@($State.original.hostKeyFiles) + @($State.generatedHostKeyFiles) |
+        ForEach-Object { ([string]$_.name).ToLowerInvariant() })
+    if ($hostKeyNames -notcontains 'ssh_host_ed25519_key') {
+        throw 'Managed state does not contain the Ed25519 host key required by sshd_config.'
+    }
 }
 
 function New-InstallTransaction {
@@ -2224,8 +2748,9 @@ function New-InstallTransaction {
         throw "OpenSSH capability servicing is not in a stable state ($($capability.State)). Finish Windows servicing or restart, then retry."
     }
     $serviceSnapshot = Get-ServiceSnapshot
-    if ([bool]$serviceSnapshot.existed -and (-not (Test-SshdServiceIdentity))) {
-        throw 'The existing sshd service is not the in-box System32 OpenSSH service running as LocalSystem.'
+    if ([bool]$serviceSnapshot.existed -and
+        ((-not (Test-SshdServiceIdentity)) -or (-not (Test-SshdServiceSecurityBoundary)))) {
+        throw 'The existing sshd service identity, DACL, or System32 OpenSSH binary boundary is unsafe.'
     }
     Assert-SafeExistingSshBaseline
     $sshDirectorySnapshot = Get-SshDirectorySnapshot
@@ -2593,8 +3118,9 @@ function Assert-InstallTransactionRollbackSafe {
 
     $rollbackService = Get-SshdServiceOrNull
     if ((Test-InstallPhaseReached -Transaction $Transaction -Phase 'service-stop') -and
-        ($null -ne $rollbackService) -and (-not (Test-SshdServiceIdentity))) {
-        throw 'The sshd service identity changed during the transaction.'
+        ($null -ne $rollbackService) -and
+        ((-not (Test-SshdServiceIdentity)) -or (-not (Test-SshdServiceSecurityBoundary)))) {
+        throw 'The sshd service identity, DACL, or binary boundary changed during the transaction.'
     }
 
     if (Test-InstallPhaseReached -Transaction $Transaction -Phase 'default-firewall') {
@@ -2653,12 +3179,13 @@ function Assert-InstallTransactionRollbackSafe {
 
     if (Test-InstallPhaseReached -Transaction $Transaction -Phase 'host-key-staging') {
         Assert-HostKeySetSafeForRollback -Transaction $Transaction
-        foreach ($name in @('ssh_host_ed25519_key', 'ssh_host_ed25519_key.pub')) {
+        foreach ($name in @(Get-ManagedHostKeyNames)) {
             $stage = Get-PlannedHostKeyStagePath -Transaction $Transaction -Name $name
             if (-not (Test-Path -LiteralPath $stage)) { continue }
             if ((-not (Test-Path -LiteralPath $stage -PathType Leaf)) -or
                 (Test-ReparsePoint -Path $stage) -or
-                (-not (Test-PathProtectedFromUntrustedMutation -Path $stage -DenyUntrustedRead ($name -eq 'ssh_host_ed25519_key')))) {
+                (-not (Test-PathProtectedFromUntrustedMutation -Path $stage `
+                        -DenyUntrustedRead ($name -match '_key$')))) {
                 throw "A host-key staging path changed identity: $stage"
             }
             $planned = @($Transaction.plannedHostKeyFiles | Where-Object { [string]$_.name -eq $name })
@@ -2666,6 +3193,7 @@ function Assert-InstallTransactionRollbackSafe {
                 throw "A host-key staging file changed content: $stage"
             }
         }
+        Assert-HostKeyProbeTreeProtected -Transaction $Transaction
     }
 
     $configStage = Get-ManagedConfigStagePath -Transaction $Transaction
@@ -2731,6 +3259,13 @@ function Remove-SshBoundaryStaging {
     }
     $children = @(Get-ChildItem -LiteralPath $directoryStage -Force)
     foreach ($child in $children) {
+        if ([string]$child.Name -eq 'logs') {
+            if (-not (Test-SshLogsDirectoryProtected -Path $child.FullName -RequireEmpty $true -ManagedExact $true)) {
+                throw 'The OpenSSH directory staging path contains an unsafe logs directory.'
+            }
+            [IO.Directory]::Delete($child.FullName, $false)
+            continue
+        }
         if (($child.Name -ne $script:SshOwnershipMarkerName) -or $child.PSIsContainer -or
             (Test-ReparsePoint -Path $child.FullName) -or
             (-not (Test-PathProtectedFromUntrustedMutation -Path $child.FullName))) {
@@ -2770,6 +3305,7 @@ function Assert-ExistingSshDirectoryUnchanged {
         (Test-ReparsePoint -Path $script:SshPath) -or
         (-not (Test-ParentProtectsChildFromUntrustedReplacement -ChildPath $script:SshPath)) -or
         (-not (Test-PathProtectedFromUntrustedMutation -Path $script:SshPath)) -or
+        (-not (Test-SshLogsDirectoryProtected -Path $script:SshLogsPath)) -or
         ((Get-Acl -LiteralPath $script:SshPath).Sddl -ne [string]$Record.original.sshDirectory.sddl) -or
         ([int](Get-Item -LiteralPath $script:SshPath -Force).Attributes -ne
             [int]$Record.original.sshDirectory.attributes)) {
@@ -2821,10 +3357,21 @@ function Assert-NewSshTreeOwned {
     }
 
     $children = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)
+    $logsCount = 0
     foreach ($child in $children) {
-        if ($child.PSIsContainer -or (Test-ReparsePoint -Path $child.FullName)) {
-            throw "The transaction-created OpenSSH directory contains an unowned directory or reparse point: $($child.FullName)"
+        if (Test-ReparsePoint -Path $child.FullName) {
+            throw "The transaction-created OpenSSH directory contains a reparse point: $($child.FullName)"
         }
+        if ($child.PSIsContainer) {
+            if (([string]$child.Name -ine 'logs') -or
+                (-not (Test-SshLogsDirectoryProtected -Path $child.FullName -RequireEmpty $true -ManagedExact $true))) {
+                throw "The transaction-created OpenSSH directory contains an unowned directory: $($child.FullName)"
+            }
+            $logsCount++
+        }
+    }
+    if ($logsCount -ne 1) {
+        throw 'The transaction-created OpenSSH directory must contain one exact, empty logs directory.'
     }
 
     $markerName = $script:SshOwnershipMarkerName.ToLowerInvariant()
@@ -2833,6 +3380,7 @@ function Assert-NewSshTreeOwned {
     $configCount = 0
     $hostChildren = New-Object System.Collections.ArrayList
     foreach ($child in $children) {
+        if ($child.PSIsContainer) { continue }
         $name = ([string]$child.Name).ToLowerInvariant()
         if ($name -eq $markerName) {
             $markerCount++
@@ -3030,15 +3578,25 @@ function Get-CleanupRetiringPath {
 
 function Get-CleanupAllowedRootNames {
     param([Parameter(Mandatory = $true)][string]$TransactionId)
-    return @(
+    $names = New-Object System.Collections.ArrayList
+    foreach ($name in @(
         'state.json', 'transaction.json', 'authorized_keys',
         'ssh-marker.retired', 'ssh-directory.retired',
         "ssh-marker.$TransactionId.tmp", "ssh-directory.$TransactionId.tmp",
         "authorized-keys.$TransactionId.staged", "sshd-config.$TransactionId.staged",
-        "host-key.$TransactionId.ssh_host_ed25519_key.staged",
-        "host-key.$TransactionId.ssh_host_ed25519_key.staged.pub",
+        "host-key-probe.$TransactionId",
         "config-restore.$TransactionId.next"
-    )
+    )) { [void]$names.Add($name) }
+    foreach ($hostKeyName in @(Get-ManagedHostKeyNames)) {
+        $privateName = if ($hostKeyName.EndsWith('.pub', [StringComparison]::Ordinal)) {
+            $hostKeyName.Substring(0, $hostKeyName.Length - 4)
+        } else { $hostKeyName }
+        $suffix = if ($hostKeyName.EndsWith('.pub', [StringComparison]::Ordinal)) {
+            "$privateName.staged.pub"
+        } else { "$privateName.staged" }
+        [void]$names.Add("host-key.$TransactionId.$suffix")
+    }
+    return @($names)
 }
 
 function Get-CleanupRecordFromFrozenRoot {
@@ -3236,6 +3794,7 @@ function Test-ServiceMatchesSnapshot {
         $current = Get-ServiceSnapshot
         if ([bool]$current.existed -ne [bool]$Snapshot.existed) { return $false }
         if (-not [bool]$Snapshot.existed) { return $true }
+        if ((-not (Test-SshdServiceIdentity)) -or (-not (Test-SshdServiceSecurityBoundary))) { return $false }
         return ([string]$current.status -eq [string]$Snapshot.status) -and
             ([string]$current.startType -eq [string]$Snapshot.startType) -and
             ([string]$current.startName -eq [string]$Snapshot.startName) -and
@@ -3249,7 +3808,7 @@ function Test-ServiceSafeForRestore {
     if (-not [bool]$Snapshot.existed) {
         try { return $null -eq (Get-SshdServiceOrNull) } catch { return $false }
     }
-    if (-not (Test-SshdServiceIdentity)) { return $false }
+    if ((-not (Test-SshdServiceIdentity)) -or (-not (Test-SshdServiceSecurityBoundary))) { return $false }
     try {
         $current = Get-ServiceSnapshot
         return ([string]$current.status -in @('Running', 'Stopped')) -and
@@ -3576,6 +4135,7 @@ function Invoke-OwnedCleanup {
             }
             Restore-ServiceSnapshot -Snapshot $Record.original.service
         }
+        Remove-PlannedHostKeyStagingFiles -Transaction $Record
         Remove-SshBoundaryStaging -Transaction $Record
         Assert-CleanupBaselineConverged -Record $Record -Kind $Kind
         Complete-RootRetirement -Record $Record
@@ -3766,8 +4326,8 @@ function Install-WindowsRemoteBootstrap {
         $serviceRecord = Get-SshdServiceOrNull
         if ($null -eq $serviceRecord) { throw 'OpenSSH capability is installed, but the sshd service is missing.' }
         $service = $serviceRecord.Controller
-        if (-not (Test-SshdServiceIdentity)) {
-            throw 'The sshd service must run the in-box System32 OpenSSH binary as LocalSystem.'
+        if ((-not (Test-SshdServiceIdentity)) -or (-not (Test-SshdServiceSecurityBoundary))) {
+            throw 'The sshd service identity, DACL, or System32 OpenSSH binary boundary is unsafe.'
         }
         if ([string]$transaction.phase -eq 'capability') {
             $serviceBeforeStop = Get-CimInstance -ClassName Win32_Service -Filter "Name='sshd'" -ErrorAction Stop
@@ -4149,6 +4709,8 @@ function Invoke-WindowsRemoteBootstrapAudit {
     $serviceOk = ($null -ne $service) -and ($service.Status -eq 'Running') -and ([string]$service.StartType -eq 'Automatic')
     Add-AuditCheck 'sshd-service' $serviceOk $serviceDetail
     Add-AuditCheck 'sshd-service-identity' (Test-SshdServiceIdentity) 'System32 OpenSSH sshd.exe as LocalSystem'
+    Add-AuditCheck 'sshd-service-security' (Test-SshdServiceSecurityBoundary) `
+        'service DACL/owner and sshd/ssh-keygen binary boundaries deny untrusted mutation'
 
     $listenerOk = Test-SshdListenerExact -SshPort ([int]$state.port)
     Add-AuditCheck 'sshd-listeners' $listenerOk "sshd PID only TCP/$($state.port)"
