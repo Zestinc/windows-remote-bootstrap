@@ -18,7 +18,8 @@ function Assert-True {
 
 function Invoke-Installer {
     param([string[]]$Arguments)
-    & $installer @Arguments
+    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $installer @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw "Installer failed with exit code $LASTEXITCODE"
     }
@@ -33,7 +34,7 @@ try {
             Add-WindowsCapability -Online -Name 'OpenSSH.Client~~~~0.0.1.0' | Out-Null
         }
     }
-    & $sshKeygen -q -t ed25519 -N '' -C 'ci-test' -f $keyPath
+    & $sshKeygen -q -t ed25519 -N '""' -C 'ci-test' -f $keyPath
     if ($LASTEXITCODE -ne 0) { throw 'Unable to generate CI SSH key.' }
 
     $publicKey = (Get-Content -LiteralPath "$keyPath.pub" -Raw).Trim()
@@ -76,18 +77,17 @@ try {
     $power = & $ssh @sshArguments 'powercfg.exe /getactivescheme' 2>&1
     Assert-True ($LASTEXITCODE -eq 0) "remote powercfg failed: $($power -join ' ')"
 
-    & $installer -Mode Audit
-    Assert-True ($LASTEXITCODE -eq 0) 'audit did not report compliant after install'
+    Invoke-Installer -Arguments @('-Mode', 'Audit')
 
-    & $installer -Mode Uninstall
-    Assert-True ($LASTEXITCODE -eq 0) 'uninstall failed'
+    Invoke-Installer -Arguments @('-Mode', 'Uninstall')
     Assert-True ($null -eq (Get-LocalUser -Name macremote -ErrorAction SilentlyContinue)) 'managed account remains after uninstall'
     Assert-True ($null -eq (Get-NetFirewallRule -Name 'WindowsRemoteBootstrap-SSH-In' -ErrorAction SilentlyContinue)) 'managed firewall rule remains after uninstall'
 
     Write-Output 'All native Windows tests passed.'
 } finally {
     if (Test-Path -LiteralPath 'C:\ProgramData\WindowsRemoteBootstrap\state.json') {
-        & $installer -Mode Uninstall -ErrorAction SilentlyContinue
+        $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $installer -Mode Uninstall
     }
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
