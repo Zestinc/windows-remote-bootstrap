@@ -16,7 +16,6 @@ $sshRoot = Join-Path $env:ProgramData 'ssh'
 $configPath = Join-Path $sshRoot 'sshd_config'
 $managedRoot = Join-Path $env:ProgramData 'WindowsRemoteBootstrap'
 $cleanupRoot = Join-Path $env:ProgramData '.WindowsRemoteBootstrap.cleanup'
-$receiptPath = Join-Path $env:PUBLIC 'Documents\WindowsRemoteBootstrap-receipt.json'
 $managedRuleName = 'WindowsRemoteBootstrap-SSH-In'
 $testRoot = Join-Path $env:TEMP ("WindowsRemoteBootstrapTests-$([Guid]::NewGuid().ToString('N'))")
 $clientKey = Join-Path $testRoot 'id_ed25519'
@@ -200,7 +199,6 @@ function Invoke-InstallerRaw {
         [string]$CrashAfter = ''
     )
 
-    Remove-Item -LiteralPath $receiptPath -Force -ErrorAction SilentlyContinue
     $oldThrow = [string]$env:WRB_TEST_THROW_AFTER
     $oldCrash = [string]$env:WRB_TEST_CRASH_AFTER
     try {
@@ -212,14 +210,21 @@ function Invoke-InstallerRaw {
         $env:WRB_TEST_THROW_AFTER = $oldThrow
         $env:WRB_TEST_CRASH_AFTER = $oldCrash
     }
+    $receiptPrefix = 'WINDOWS_REMOTE_BOOTSTRAP_RECEIPT_JSON='
+    $receiptLines = @($output | ForEach-Object { [string]$_ } |
+        Where-Object { $_.StartsWith($receiptPrefix, [StringComparison]::Ordinal) })
     $receipt = $null
-    if (Test-Path -LiteralPath $receiptPath) {
-        try { $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json } catch { $receipt = $null }
+    if ($receiptLines.Count -eq 1) {
+        try {
+            $receipt = $receiptLines[0].Substring($receiptPrefix.Length) | ConvertFrom-Json
+        } catch {
+            $receipt = $null
+        }
     }
     return [pscustomobject]@{
         ExitCode = $code
         Output = @($output | ForEach-Object { [string]$_ })
-        ReceiptExists = Test-Path -LiteralPath $receiptPath
+        ReceiptExists = ($receiptLines.Count -gt 0)
         Receipt = $receipt
     }
 }
@@ -277,6 +282,7 @@ function Test-WinctlPowerControl {
     $bash = Join-Path $env:ProgramFiles 'Git\bin\bash.exe'
     Assert-True (Test-Path -LiteralPath $bash -PathType Leaf) 'Git Bash is unavailable for the macOS helper test'
     $before = Get-TestPowerValue -SubGroup 'SUB_VIDEO' -Setting 'VIDEOIDLE'
+    $stderrPath = Join-Path $testRoot 'winctl.stderr'
     try {
         $previousErrorActionPreference = $ErrorActionPreference
         try {
@@ -284,12 +290,15 @@ function Test-WinctlPowerControl {
             $output = @(& $bash (ConvertTo-MsysPath -Path $winctl) `
                     '--identity' (ConvertTo-MsysPath -Path $clientKey) `
                     '--known-hosts' (ConvertTo-MsysPath -Path $knownHosts) `
-                    '--port' ([string]$testPort) '127.0.0.1' 'display' '17' '19' 2>&1)
+                    '--port' ([string]$testPort) '127.0.0.1' 'display' '17' '19' 2> $stderrPath)
             $winctlExitCode = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = $previousErrorActionPreference
         }
-        Assert-True ($winctlExitCode -eq 0) "winctl failed: $($output -join ' ')"
+        $stderr = if (Test-Path -LiteralPath $stderrPath) {
+            Get-Content -LiteralPath $stderrPath -Raw
+        } else { '' }
+        Assert-True ($winctlExitCode -eq 0) "winctl failed: stdout=$($output -join ' ') stderr=$stderr"
         $receipt = ($output -join "`n") | ConvertFrom-Json
         Assert-Equal 'updated' ([string]$receipt.status) 'winctl update status'
         Assert-Equal 1020 ([int64]$receipt.effective.acSeconds) 'winctl AC display readback'
@@ -298,6 +307,7 @@ function Test-WinctlPowerControl {
         Assert-Equal 1020 $actual.AcSeconds 'system AC display setting after winctl'
         Assert-Equal 1140 $actual.DcSeconds 'system DC display setting after winctl'
     } finally {
+        Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
         & powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_VIDEO VIDEOIDLE ([string]$before.AcSeconds) | Out-Null
         if ($LASTEXITCODE -ne 0) { throw 'failed to restore the AC display timeout after winctl test' }
         & powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_VIDEO VIDEOIDLE ([string]$before.DcSeconds) | Out-Null
@@ -428,6 +438,19 @@ try {
         Assert-Result $uninstall 0 'uninstalled' 'smoke uninstall'
         Assert-BaselineExact -Expected $baseline -Context 'smoke uninstall'
     } else {
+        $crashedScaffolding = Invoke-InstallerRaw -Arguments $installArguments `
+            -CrashAfter 'root-before-transaction'
+        Assert-True (($crashedScaffolding.ExitCode -ne 0) -and
+            (-not $crashedScaffolding.ReceiptExists)) `
+            'pre-transaction root hard crash did not terminate cleanly'
+        Assert-True ((Test-Path -LiteralPath $managedRoot -PathType Container) -and
+            (Test-Path -LiteralPath $cleanupRoot -PathType Container) -and
+            (-not (Test-Path -LiteralPath (Join-Path $managedRoot 'transaction.json')))) `
+            'pre-transaction root crash did not preserve the expected unjournaled scaffold'
+        Assert-Result (Invoke-InstallerRaw -Arguments @('-Mode', 'Uninstall')) `
+            0 'already-uninstalled' 'pre-transaction root direct cleanup'
+        Assert-BaselineExact -Expected $baseline -Context 'pre-transaction root recovery'
+
         foreach ($stage in @('account-before-sid-journal', 'service')) {
             $failed = Invoke-InstallerRaw -Arguments $installArguments -ThrowAfter $stage
             Assert-Result $failed 1 'failed' "throw recovery $stage"
@@ -448,6 +471,15 @@ try {
             Assert-True (($crashedRetirement.ExitCode -ne 0) -and
                 (-not $crashedRetirement.ReceiptExists)) `
                 "$retirementStage hard crash did not terminate cleanup"
+            if ($retirementStage -eq 'cleanup-tombstone-partial') {
+                $tombstones = @(Get-ChildItem -LiteralPath $cleanupRoot -Force -ErrorAction Stop)
+                Assert-True (($tombstones.Count -eq 1) -and
+                    ([string]$tombstones[0].Name -match '^retired\.[0-9a-f]{32}$')) `
+                    'partial cleanup did not preserve one committed tombstone'
+                Assert-True ((-not (Test-Path -LiteralPath (Join-Path $tombstones[0].FullName 'state.json'))) -and
+                    (-not (Test-Path -LiteralPath (Join-Path $tombstones[0].FullName 'transaction.json')))) `
+                    'partial cleanup crash did not remove the authoritative journal first'
+            }
             $retirementRetry = Invoke-InstallerRaw -Arguments @('-Mode', 'Uninstall')
             Assert-Result $retirementRetry 0 'already-uninstalled' "$retirementStage retry"
             Assert-BaselineExact -Expected $baseline -Context "$retirementStage recovery"
@@ -693,8 +725,7 @@ try {
     Write-Output "Windows $Suite tests passed."
 } finally {
     try {
-        if ((Test-Path -LiteralPath (Join-Path $managedRoot 'state.json')) -or
-            (Test-Path -LiteralPath (Join-Path $managedRoot 'transaction.json'))) {
+        if (Test-Path -LiteralPath $managedRoot) {
             [void](Invoke-InstallerRaw -Arguments @('-Mode', 'Uninstall'))
         }
     } catch {

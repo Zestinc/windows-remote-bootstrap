@@ -75,7 +75,7 @@ power_query_function='function Get-PowerValue([string]$SubGroup,[string]$Setting
 case "$action" in
   status)
     [ "$#" -eq 0 ] || { usage >&2; exit 64; }
-    remote_script="$power_query_function; [ordered]@{ computerName = \$env:COMPUTERNAME; identity = (& whoami.exe); isAdministrator = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator); activeScheme = ((& powercfg.exe /getactivescheme) | Out-String).Trim(); display = Get-PowerValue 'SUB_VIDEO' 'VIDEOIDLE'; sleep = Get-PowerValue 'SUB_SLEEP' 'STANDBYIDLE' } | ConvertTo-Json -Depth 4"
+    remote_script="$power_query_function; [ordered]@{ computerName = \$env:COMPUTERNAME; identity = (& whoami.exe); isAdministrator = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator); activeScheme = ((& powercfg.exe /getactivescheme) | Out-String).Trim(); display = Get-PowerValue 'SUB_VIDEO' 'VIDEOIDLE'; sleep = Get-PowerValue 'SUB_SLEEP' 'STANDBYIDLE' } | ConvertTo-Json -Depth 4 -Compress"
     ;;
   display|sleep)
     [ "$#" -ge 1 ] && [ "$#" -le 2 ] || { usage >&2; exit 64; }
@@ -94,7 +94,7 @@ case "$action" in
       subgroup=SUB_SLEEP
       setting=STANDBYIDLE
     fi
-    remote_script="$power_query_function; & powercfg.exe /change '$ac_setting' $ac_minutes; if (\$LASTEXITCODE -ne 0) { throw 'powercfg AC update failed' }; & powercfg.exe /change '$dc_setting' $dc_minutes; if (\$LASTEXITCODE -ne 0) { throw 'powercfg DC update failed' }; \$effective = Get-PowerValue '$subgroup' '$setting'; if (([int64]\$effective.acSeconds -ne ([int64]$ac_minutes * 60)) -or ([int64]\$effective.dcSeconds -ne ([int64]$dc_minutes * 60))) { throw 'powercfg update did not converge to the requested values' }; [ordered]@{ status = 'updated'; setting = '$action'; requestedAcMinutes = $ac_minutes; requestedDcMinutes = $dc_minutes; effective = \$effective } | ConvertTo-Json -Depth 4"
+    remote_script="$power_query_function; & powercfg.exe /change '$ac_setting' $ac_minutes; if (\$LASTEXITCODE -ne 0) { throw 'powercfg AC update failed' }; & powercfg.exe /change '$dc_setting' $dc_minutes; if (\$LASTEXITCODE -ne 0) { throw 'powercfg DC update failed' }; \$effective = Get-PowerValue '$subgroup' '$setting'; if (([int64]\$effective.acSeconds -ne ([int64]$ac_minutes * 60)) -or ([int64]\$effective.dcSeconds -ne ([int64]$dc_minutes * 60))) { throw 'powercfg update did not converge to the requested values' }; [ordered]@{ status = 'updated'; setting = '$action'; requestedAcMinutes = $ac_minutes; requestedDcMinutes = $dc_minutes; effective = \$effective } | ConvertTo-Json -Depth 4 -Compress"
     ;;
   *)
     printf 'Unknown action: %s\n' "$action" >&2
@@ -108,7 +108,6 @@ encoded_command=$(printf '%s' "$remote_script" | iconv -f UTF-8 -t UTF-16LE | ba
 set -- \
   -p "$remote_port" \
   -o BatchMode=no \
-  -o StrictHostKeyChecking=ask \
   -o PasswordAuthentication=no \
   -o PreferredAuthentications=publickey
 
@@ -117,6 +116,8 @@ if [ -n "$identity_file" ]; then
 fi
 if [ -n "$known_hosts_file" ]; then
   set -- "$@" -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts_file"
+else
+  set -- "$@" -o StrictHostKeyChecking=ask
 fi
 
 exec ssh "$@" "$remote_user@$remote_host" \

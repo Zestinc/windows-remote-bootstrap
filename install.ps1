@@ -27,7 +27,6 @@ $script:CapabilityName = 'OpenSSH.Server~~~~0.0.1.0'
 $script:FirewallRuleName = 'WindowsRemoteBootstrap-SSH-In'
 $script:ProgramDataPath = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
 $script:SystemPath = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)
-$script:PublicDocumentsPath = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonDocuments)
 $script:RootPath = Join-Path $script:ProgramDataPath $script:ProgramName
 $script:CleanupRootPath = Join-Path $script:ProgramDataPath (".$($script:ProgramName).cleanup")
 $script:StatePath = Join-Path $script:RootPath 'state.json'
@@ -36,7 +35,6 @@ $script:KeyPath = Join-Path $script:RootPath 'authorized_keys'
 $script:SshPath = Join-Path $script:ProgramDataPath 'ssh'
 $script:SshConfigPath = Join-Path $script:SshPath 'sshd_config'
 $script:SshOwnershipMarkerName = '.WindowsRemoteBootstrap.owner'
-$script:PublicReceiptPath = Join-Path $script:PublicDocumentsPath 'WindowsRemoteBootstrap-receipt.json'
 $script:GlobalBegin = '# BEGIN WINDOWS-REMOTE-BOOTSTRAP MANAGED CONFIG'
 $script:GlobalEnd = '# END WINDOWS-REMOTE-BOOTSTRAP MANAGED CONFIG'
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -73,22 +71,6 @@ function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-}
-
-function Write-JsonFile {
-    param(
-        [Parameter(Mandatory = $true)]$Value,
-        [Parameter(Mandatory = $true)][string]$Path
-    )
-
-    $json = $Value | ConvertTo-Json -Depth 10
-    $directory = Split-Path -Parent $Path
-    if (-not (Test-Path -LiteralPath $directory)) {
-        [void](New-Item -Path $directory -ItemType Directory -Force)
-    }
-    $temporaryPath = "$Path.$([Guid]::NewGuid().ToString('N')).tmp"
-    [IO.File]::WriteAllText($temporaryPath, $json, $script:Utf8NoBom)
-    Move-Item -LiteralPath $temporaryPath -Destination $Path -Force
 }
 
 function Write-ProtectedJsonFile {
@@ -160,14 +142,10 @@ function Remove-OrphanedProtectedJsonStaging {
 function Write-PublicReceipt {
     param([Parameter(Mandatory = $true)]$Receipt)
 
-    Write-Output '=== WINDOWS_REMOTE_BOOTSTRAP_RECEIPT ==='
-    Write-Output ($Receipt | ConvertTo-Json -Depth 10)
-    try {
-        Write-JsonFile -Value $Receipt -Path $script:PublicReceiptPath
-        Write-Output "Receipt: $script:PublicReceiptPath"
-    } catch {
-        Write-Warning "The operation committed, but the public receipt file could not be written: $($_.Exception.Message)"
-    }
+    # An elevated process must not write a fixed path in a user-writable
+    # namespace. Emit one prefixed record for launchers and tests to capture.
+    Write-Output ('WINDOWS_REMOTE_BOOTSTRAP_RECEIPT_JSON=' +
+        ($Receipt | ConvertTo-Json -Depth 10 -Compress))
 }
 
 function Get-FileSha256 {
@@ -387,6 +365,25 @@ function Initialize-ManagedCleanupRoot {
     }
     New-ManagedDirectoryProtectedAtCreation -Path $script:CleanupRootPath
     Assert-ManagedCleanupRoot -RequireEmpty $true
+}
+
+function Remove-UnjournaledInstallScaffolding {
+    if (-not (Test-Path -LiteralPath $script:RootPath)) { return $false }
+
+    Assert-TrustedProgramPath -Path $script:RootPath -Directory $true
+    $children = @(Get-ChildItem -LiteralPath $script:RootPath -Force -ErrorAction Stop)
+    if ($children.Count -ne 0) {
+        throw "The managed root contains data without a trusted state or transaction; refusing to delete it."
+    }
+    Assert-ManagedCleanupRoot -RequireEmpty $true
+
+    # Both deletes are deliberately non-recursive. These exact, empty,
+    # administrator-only directories are the only possible artifacts between
+    # publishing the root boundary and publishing the first transaction.
+    [IO.Directory]::Delete($script:RootPath, $false)
+    Assert-ManagedCleanupRoot -RequireEmpty $true
+    [IO.Directory]::Delete($script:CleanupRootPath, $false)
+    return $true
 }
 
 function ConvertTo-SidValue {
@@ -798,7 +795,7 @@ function Assert-SupportedEnvironment {
     if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
         throw 'Run the 64-bit Windows PowerShell from System32, not the 32-bit SysWOW64 host.'
     }
-    foreach ($knownFolder in @($script:ProgramDataPath, $script:SystemPath, $script:PublicDocumentsPath)) {
+    foreach ($knownFolder in @($script:ProgramDataPath, $script:SystemPath)) {
         if ([string]::IsNullOrWhiteSpace([string]$knownFolder) -or
             (-not [IO.Path]::IsPathRooted([string]$knownFolder))) {
             throw 'Windows returned an invalid canonical known-folder path.'
@@ -1290,16 +1287,31 @@ function Get-HostKeyFingerprint {
         throw 'The managed Ed25519 host key is missing or is not a regular file.'
     }
     $keygen = Get-SshKeygenExecutable
-    $output = & $keygen -l -E sha256 -f $path 2>&1
+    # ssh-keygen -l may prefer a same-name .pub companion and therefore report
+    # a key sshd is not actually using. Derive the public blob from the private
+    # key, then calculate the OpenSSH SHA256 fingerprint directly.
+    $output = & $keygen -y -f $path 2>&1
     if ($LASTEXITCODE -ne 0) {
-        throw "ssh-keygen could not fingerprint the managed host key: $($output -join ' ')"
+        throw "ssh-keygen could not derive the managed host public key: $($output -join ' ')"
     }
-    $tokens = @(([string]($output | Select-Object -First 1)) -split '\s+' |
-        Where-Object { $_ -match '^SHA256:[A-Za-z0-9+/]{43}={0,2}$' })
-    if ($tokens.Count -ne 1) {
-        throw 'ssh-keygen returned an unrecognized SHA-256 host-key fingerprint.'
+    $publicKeyLines = @($output | ForEach-Object { [string]$_ } |
+        Where-Object { $_ -match '^ssh-ed25519\s+[A-Za-z0-9+/]+={0,2}\s*$' })
+    if ($publicKeyLines.Count -ne 1) {
+        throw 'ssh-keygen returned an unrecognized Ed25519 public key.'
     }
-    return [string]$tokens[0]
+    $parts = @($publicKeyLines[0] -split '\s+')
+    try {
+        $blob = [Convert]::FromBase64String([string]$parts[1])
+    } catch {
+        throw 'ssh-keygen returned an invalid Ed25519 public-key blob.'
+    }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = $sha.ComputeHash($blob)
+    } finally {
+        $sha.Dispose()
+    }
+    return 'SHA256:' + ([Convert]::ToBase64String($digest).TrimEnd('='))
 }
 
 function ConvertTo-CanonicalStringArray {
@@ -2280,6 +2292,7 @@ function New-InstallTransaction {
     Initialize-ManagedCleanupRoot
     if (-not $reuseProtectedRoot) {
         New-ManagedDirectoryProtectedAtCreation -Path $script:RootPath
+        Invoke-TestHook -Stage 'root-before-transaction'
     }
     Write-ProtectedJsonFile -Value $transaction -Path $script:TransactionPath
     $persisted = Get-InstallTransaction
@@ -3121,11 +3134,16 @@ function Remove-CleanupTombstone {
     Assert-OwnedTreeSafeToDelete -Path $Path
     if (([string]$env:GITHUB_ACTIONS -eq 'true') -and
         ([string]$env:WRB_TEST_CRASH_AFTER -eq 'cleanup-tombstone-partial')) {
-        $firstChild = Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop |
+        # Delete the authoritative journal first. Recovery from a committed
+        # retired.* tombstone must never depend on a record that recursive
+        # deletion may already have removed before a power loss.
+        $journalChild = Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop |
+            Where-Object { [string]$_.Name -in @('state.json', 'transaction.json') } |
             Sort-Object Name | Select-Object -First 1
-        if ($null -ne $firstChild) {
-            Remove-Item -LiteralPath $firstChild.FullName -Recurse -Force -ErrorAction Stop
+        if ($null -eq $journalChild) {
+            throw 'The partial-tombstone test hook found no cleanup journal to delete.'
         }
+        Remove-Item -LiteralPath $journalChild.FullName -Force -ErrorAction Stop
         Invoke-TestHook -Stage 'cleanup-tombstone-partial'
     }
     Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
@@ -4194,6 +4212,7 @@ function Uninstall-WindowsRemoteBootstrap {
     if ($null -eq $state) {
         $transaction = Get-InstallTransaction
         if ($null -eq $transaction) {
+            [void](Remove-UnjournaledInstallScaffolding)
             return [ordered]@{
                 status = 'already-uninstalled'
                 installerVersion = $script:InstallerVersion

@@ -51,7 +51,7 @@ backed up for uninstall and rollback.
 - Firewall: one program-owned inbound rule; the default broad OpenSSH rule is
   disabled.
 - State and rollback data: `%ProgramData%\WindowsRemoteBootstrap`.
-- Shareable receipt: `%PUBLIC%\Documents\WindowsRemoteBootstrap-receipt.json`.
+- Machine-readable operation receipt: one prefixed JSON record on standard output.
 
 ## Audit and uninstall
 

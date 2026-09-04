@@ -19,6 +19,8 @@ $required = @(
     "Test-EffectiveSshPolicy",
     "managedConfigSha256",
     "hostKeyFingerprint",
+    "WINDOWS_REMOTE_BOOTSTRAP_RECEIPT_JSON=",
+    '$keygen -y -f $path',
     "Set-ExactAcl",
     "AllowBypass",
     "Language.NullString]::Value"
@@ -35,11 +37,20 @@ $forbidden = @(
     'PasswordAuthentication yes',
     '-RemoteAddress Any',
     'Invoke-SelfElevation',
+    'PublicReceiptPath',
+    'SpecialFolder]::CommonDocuments',
+    'Write-JsonFile',
     "'/grant:r'"
 )
 foreach ($needle in $forbidden) {
     if ($text.Contains($needle)) {
         throw "Forbidden security pattern found: $needle"
+    }
+}
+
+foreach ($strictSetting in @('-o StrictHostKeyChecking=ask', '-o StrictHostKeyChecking=yes')) {
+    if ([regex]::Matches($winctlText, [regex]::Escape($strictSetting)).Count -ne 1) {
+        throw "macOS control helper must select exactly one '$strictSetting' branch."
     }
 }
 
@@ -55,6 +66,7 @@ foreach ($needle in @(
         '-o StrictHostKeyChecking=ask',
         '$values[$values.Count - 2]',
         '$values[$values.Count - 1]',
+        'ConvertTo-Json -Depth 4 -Compress',
         'powercfg update did not converge to the requested values'
     )) {
     if (-not $winctlText.Contains($needle)) {
