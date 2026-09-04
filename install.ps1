@@ -710,7 +710,7 @@ function Assert-FirewallPreconditions {
     }
     $competing = @(Get-CompetingSshFirewallRules -SshPort $SshPort -SshdExe $SshdExe)
     if ($competing.Count -gt 0) {
-        throw "Other enabled inbound allow rules can reach sshd on TCP/$SshPort: $($competing -join ', '). Disable or narrow them before installing."
+        throw "Other enabled inbound allow rules can reach sshd on TCP/${SshPort}: $($competing -join ', '). Disable or narrow them before installing."
     }
 }
 
