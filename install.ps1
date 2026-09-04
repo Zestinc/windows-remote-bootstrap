@@ -584,7 +584,8 @@ function Assert-OpenSshHostKeysProtected {
         # protected SYSTEM/Administrators ACL. Do not rewrite those
         # service-owned files; fail closed if their ACL is unexpectedly broad.
         if (-not (Test-ManagedFileAcl -Path $hostKey.FullName)) {
-            throw "OpenSSH private host key has an unexpected ACL: $($hostKey.FullName)"
+            $acl = Get-Acl -LiteralPath $hostKey.FullName
+            throw "OpenSSH private host key has an unexpected ACL: $($hostKey.FullName); owner=$($acl.Owner); protected=$($acl.AreAccessRulesProtected); sddl=$($acl.Sddl)"
         }
     }
 }
@@ -696,7 +697,7 @@ function Get-CompetingSshFirewallRules {
         $serviceName = if ($null -eq $serviceFilter) { 'Any' } else { [string]$serviceFilter.Service }
         $serviceApplies = ($serviceName -eq 'Any') -or ($serviceName -eq 'sshd')
         if ($programApplies -and $packageApplies -and $serviceApplies) {
-            [void]$competing.Add([string]$rule.Name)
+            [void]$competing.Add("$([string]$rule.Name) [owner=$([string]$rule.Owner); package=$package; program=$program; service=$serviceName]")
         }
     }
     return @($competing)
