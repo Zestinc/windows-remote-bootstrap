@@ -703,7 +703,7 @@ function Get-ActiveIPv4Addresses {
 }
 
 function Get-HostKeyFingerprint {
-    $path = Join-Path $script:SshPath 'ssh_host_ed25519_key.pub'
+    $path = Join-Path $script:SshPath 'ssh_host_ed25519_key'
     if (-not (Test-Path -LiteralPath $path)) {
         return $null
     }
@@ -1096,6 +1096,9 @@ function Assert-SnapshotShape {
             $Original.defaultFirewall.enabled)) {
         if ($value -isnot [bool]) { throw 'A recorded baseline boolean is invalid.' }
     }
+    if ([string]::IsNullOrWhiteSpace([string]$Original.capabilityState)) {
+        throw 'The original OpenSSH capability state is missing.'
+    }
     if ([bool]$Original.sshDirectory.existed) {
         Assert-ValidSecurityDescriptor -Sddl ([string]$Original.sshDirectory.sddl)
         try { [void][int]$Original.sshDirectory.attributes } catch { throw 'Invalid OpenSSH directory attributes.' }
@@ -1138,6 +1141,10 @@ function Assert-TransactionShape {
     Assert-AllowedRemoteAddress -Values @($Transaction.allowedRemoteAddress)
     if (([int]$Transaction.port -lt 1) -or ([int]$Transaction.port -gt 65535)) { throw 'Invalid transaction SSH port.' }
     if ([string]$Transaction.authorizedKeysCanonicalSha256 -notmatch '^[0-9a-f]{64}$') { throw 'Invalid transaction key hash.' }
+    if (($Transaction.capabilityInstalledByTool -isnot [bool]) -or
+        ($Transaction.takeOverExistingSshd -isnot [bool])) {
+        throw 'Invalid transaction ownership flags.'
+    }
     if ([string]$Transaction.phase -notin @('created', 'capability', 'ssh-directory', 'account', 'host-keys', 'config', 'firewall', 'service', 'state-commit')) {
         throw 'Invalid install transaction phase.'
     }
@@ -1164,6 +1171,9 @@ function Assert-StateShape {
     }
     if ([string]$State.accountSid -notmatch '^S-1-5-21-') { throw 'Invalid managed account SID.' }
     if ([string]$State.firewallRuleName -ne $script:FirewallRuleName) { throw 'Invalid managed firewall rule identity.' }
+    if (($State.openSshInstalledByTool -isnot [bool]) -or ($State.existingSshdTakenOver -isnot [bool])) {
+        throw 'Invalid managed OpenSSH ownership flags.'
+    }
     if ($State.uninstallRemoveCapability -isnot [bool]) { throw 'Invalid uninstall capability choice in managed state.' }
     Assert-SnapshotShape -Original $State.original
     Assert-HostKeyRecordsShape -Records @($State.generatedHostKeyFiles)
@@ -1198,10 +1208,15 @@ function New-InstallTransaction {
     $serviceSnapshot = Get-ServiceSnapshot
     $configSnapshot = Get-ConfigSnapshot
     $hostKeySnapshot = @(Get-HostKeyFileRecords)
+    $sshdPath = Join-Path $env:SystemRoot 'System32\OpenSSH\sshd.exe'
+    $existingWithoutCapability = ($capability.State -ne 'Installed') -and [bool]$serviceSnapshot.existed
     if (($capability.State -ne 'Installed') -and
-        ([bool]$serviceSnapshot.existed -or [bool]$configSnapshot.existed -or
-            [bool]$sshDirectorySnapshot.existed -or $hostKeySnapshot.Count -gt 0)) {
-        throw 'OpenSSH files or service exist while the Windows capability is absent; refusing an ambiguous takeover.'
+        (([bool]$configSnapshot.existed -or [bool]$sshDirectorySnapshot.existed -or $hostKeySnapshot.Count -gt 0) -and
+            (-not $existingWithoutCapability))) {
+        throw 'OpenSSH files exist without either the Windows capability or an existing sshd service; refusing an ambiguous takeover.'
+    }
+    if ($existingWithoutCapability -and (-not (Test-Path -LiteralPath $sshdPath -PathType Leaf))) {
+        throw 'An existing sshd service does not use the supported in-box System32 location.'
     }
     $hasExistingSshd = ($capability.State -eq 'Installed') -or [bool]$serviceSnapshot.existed -or [bool]$configSnapshot.existed
     if ($hasExistingSshd -and (-not $MayTakeOver)) {
@@ -1214,7 +1229,6 @@ function New-InstallTransaction {
         existed = ($defaultRules.Count -eq 1)
         enabled = ($defaultRules.Count -eq 1) -and ([string]$defaultRules[0].Enabled -eq 'True')
     }
-    $sshdPath = Join-Path $env:SystemRoot 'System32\OpenSSH\sshd.exe'
     Assert-FirewallPreconditions -SshPort $SshPort -SshdExe $sshdPath
 
     $transactionId = [Guid]::NewGuid().ToString('N')
@@ -1232,11 +1246,12 @@ function New-InstallTransaction {
         allowedRemoteAddress = @($RemoteAddress | Sort-Object -Unique)
         authorizedKeys = @($Keys)
         authorizedKeysCanonicalSha256 = $KeysCanonicalSha256
-        takeOverExistingSshd = $MayTakeOver
-        capabilityInstalledByTool = ($capability.State -ne 'Installed')
+        takeOverExistingSshd = $hasExistingSshd
+        capabilityInstalledByTool = ($capability.State -ne 'Installed') -and (-not $existingWithoutCapability)
         generatedHostKeyFiles = @()
         original = [ordered]@{
             capabilityInstalled = ($capability.State -eq 'Installed')
+            capabilityState = [string]$capability.State
             service = $serviceSnapshot
             sshDirectory = $sshDirectorySnapshot
             config = $configSnapshot
@@ -1363,7 +1378,7 @@ function Undo-InstallTransaction {
     }
 
     $restartRequired = $false
-    if (-not [bool]$Transaction.original.capabilityInstalled) {
+    if ([bool]$Transaction.capabilityInstalledByTool) {
         $capability = Get-WindowsCapability -Online -Name $script:CapabilityName
         if ($capability.State -eq 'Installed') {
             $removeResult = Remove-WindowsCapability -Online -Name $script:CapabilityName
@@ -1393,7 +1408,9 @@ function Undo-InstallTransaction {
     Restore-ConfigSnapshot -Snapshot $Transaction.original.config
     Restore-DefaultFirewallSnapshot -Snapshot $Transaction.original.defaultFirewall
     Restore-SshDirectorySnapshot -Snapshot $Transaction.original.sshDirectory `
-        -RemoveIfOriginallyAbsent ((-not [bool]$Transaction.original.capabilityInstalled) -and (-not $restartRequired))
+        -RemoveIfOriginallyAbsent ((-not [bool]$Transaction.original.sshDirectory.existed) -and
+            ([bool]$Transaction.original.service.existed -or
+                ([bool]$Transaction.capabilityInstalledByTool -and (-not $restartRequired))))
     if ([bool]$Transaction.original.sshDirectory.existed) {
         if ([bool]$Transaction.original.config.existed) {
             Set-SecurityDescriptorFromSnapshot -Path $script:SshConfigPath -Snapshot $Transaction.original.config
@@ -1442,7 +1459,11 @@ function New-InstalledReceipt {
             authorizedKeyFingerprints = @($State.keyFingerprints)
         }
         verification = [ordered]@{
-            openSshCapability = 'Installed'
+            openSsh = $(if ([bool]$State.openSshInstalledByTool -or [bool]$State.original.capabilityInstalled) {
+                'Windows capability/Installed'
+            } else {
+                'Existing in-box System32 service'
+            })
             effectiveSshdPolicy = 'exact/key-only/single-user/single-port'
             sshdService = 'Running/Automatic'
             tcpListener = "sshd-only TCP/$($State.port)"
@@ -1514,7 +1535,7 @@ function Install-WindowsRemoteBootstrap {
         $transaction.phase = 'capability'
         Update-InstallTransaction -Transaction $transaction
         $capability = Get-WindowsCapability -Online -Name $script:CapabilityName
-        if ($capability.State -ne 'Installed') {
+        if (($capability.State -ne 'Installed') -and [bool]$transaction.capabilityInstalledByTool) {
             $capabilityResult = Add-WindowsCapability -Online -Name $script:CapabilityName
             if ($capabilityResult.RestartNeeded) {
                 $transaction.status = 'restart-required'
@@ -1712,7 +1733,8 @@ function Invoke-WindowsRemoteBootstrapAudit {
     Add-AuditCheck 'state-acl' (Test-ManagedFileAcl -Path $script:StatePath) 'SYSTEM/Administrators exact FullControl'
 
     $capability = Get-WindowsCapability -Online -Name $script:CapabilityName
-    Add-AuditCheck 'openssh-capability' ($capability.State -eq 'Installed') ([string]$capability.State)
+    $expectedCapabilityState = if ([bool]$state.openSshInstalledByTool) { 'Installed' } else { [string]$state.original.capabilityState }
+    Add-AuditCheck 'openssh-capability-state' ([string]$capability.State -eq $expectedCapabilityState) ([string]$capability.State)
 
     $user = Get-LocalUser -Name ([string]$state.accountName) -ErrorAction SilentlyContinue
     $userOk = ($null -ne $user) -and
@@ -1899,7 +1921,7 @@ function Uninstall-WindowsRemoteBootstrap {
     Invoke-TestHook -Stage 'uninstall-account'
 
     $removeCapability = [bool]$state.uninstallRemoveCapability -and [bool]$state.openSshInstalledByTool
-    if ([bool]$state.original.capabilityInstalled -or $removeCapability) {
+    if ([bool]$state.existingSshdTakenOver -or $removeCapability) {
         Remove-GeneratedHostKeys -Records @($state.generatedHostKeyFiles)
     }
 
@@ -1918,7 +1940,7 @@ function Uninstall-WindowsRemoteBootstrap {
     Invoke-TestHook -Stage 'uninstall-config'
     Restore-DefaultFirewallSnapshot -Snapshot $state.original.defaultFirewall
     $removeSshDirectory = (-not [bool]$state.original.sshDirectory.existed) -and
-        ([bool]$state.original.capabilityInstalled -or ($removeCapability -and (-not $restartRequired)))
+        ([bool]$state.original.service.existed -or ($removeCapability -and (-not $restartRequired)))
     Restore-SshDirectorySnapshot -Snapshot $state.original.sshDirectory `
         -RemoveIfOriginallyAbsent $removeSshDirectory
     if ([bool]$state.original.sshDirectory.existed) {
@@ -1928,11 +1950,7 @@ function Uninstall-WindowsRemoteBootstrap {
         Restore-OriginalHostKeySecurity -Records @($state.original.hostKeyFiles)
     }
 
-    if ([bool]$state.original.capabilityInstalled) {
-        Restore-ServiceSnapshot -Snapshot $state.original.service
-    } else {
-        Restore-ServiceSnapshot -Snapshot ([ordered]@{ existed = $false; status = $null; startType = $null })
-    }
+    Restore-ServiceSnapshot -Snapshot $state.original.service
 
     if ($restartRequired) {
         $state.status = 'uninstall-restart-required'
