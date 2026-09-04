@@ -36,6 +36,7 @@ $script:SshPath = Join-Path $script:ProgramDataPath 'ssh'
 $script:SshConfigPath = Join-Path $script:SshPath 'sshd_config'
 $script:SshLogsPath = Join-Path $script:SshPath 'logs'
 $script:SshOwnershipMarkerName = '.WindowsRemoteBootstrap.owner'
+$script:SshdRuntimePidFileName = 'sshd.pid'
 $script:GlobalBegin = '# BEGIN WINDOWS-REMOTE-BOOTSTRAP MANAGED CONFIG'
 $script:GlobalEnd = '# END WINDOWS-REMOTE-BOOTSTRAP MANAGED CONFIG'
 $script:ManagedHostKeyTypes = @('dsa', 'rsa', 'ecdsa', 'ed25519')
@@ -3451,6 +3452,16 @@ function Assert-NewSshTreeOwned {
             }
         } elseif ($name -eq $configName) {
             $configCount++
+        } elseif ($name -eq $script:SshdRuntimePidFileName.ToLowerInvariant()) {
+            # sshd writes its PID file into the data directory every time the
+            # service starts and removes it again on a clean stop. It is a
+            # SYSTEM-owned runtime artifact, not operator data, so it is
+            # tolerated only as a plain file that untrusted principals cannot
+            # modify. Cleanup runs after service-stop and removes any stale
+            # copy together with the owned tree.
+            if (-not (Test-PathProtectedFromUntrustedMutation -Path $child.FullName)) {
+                throw "The sshd runtime PID file is not a protected plain file: $($child.FullName)"
+            }
         } elseif ($name -match '^ssh_host_[a-z0-9._-]+$') {
             [void]$hostChildren.Add($child)
         } else {
@@ -4688,7 +4699,7 @@ function Invoke-WindowsRemoteBootstrapAudit {
         }
     }
     Add-AuditCheck 'created-ssh-directory-owned-set' $createdSshTreeOk `
-        'new directory contains only the recorded marker, config, and host keys'
+        'new directory contains only the recorded marker, config, host keys, and the sshd runtime PID file'
 
     $hostKeysOk = $true
     $hostKeySetOk = $true
