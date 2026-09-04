@@ -1294,12 +1294,19 @@ function Get-HostKeyFingerprint {
     if ($LASTEXITCODE -ne 0) {
         throw "ssh-keygen could not derive the managed host public key: $($output -join ' ')"
     }
-    $publicKeyLines = @($output | ForEach-Object { [string]$_ } |
-        Where-Object { $_ -match '^ssh-ed25519\s+[A-Za-z0-9+/]+={0,2}\s*$' })
+    $publicKeyLines = @($output | ForEach-Object { ([string]$_).Trim() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     if ($publicKeyLines.Count -ne 1) {
+        throw "ssh-keygen returned an ambiguous public key: $($output -join ' | ')"
+    }
+    # Windows OpenSSH preserves the private key's optional comment. It is not
+    # part of the key blob or fingerprint, so parse at most three fields.
+    $parts = @($publicKeyLines[0] -split '\s+', 3)
+    if (($parts.Count -lt 2) -or
+        ([string]$parts[0] -cne 'ssh-ed25519') -or
+        ([string]$parts[1] -notmatch '^[A-Za-z0-9+/]+={0,2}$')) {
         throw 'ssh-keygen returned an unrecognized Ed25519 public key.'
     }
-    $parts = @($publicKeyLines[0] -split '\s+')
     try {
         $blob = [Convert]::FromBase64String([string]$parts[1])
     } catch {
