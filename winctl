@@ -1,0 +1,113 @@
+#!/bin/sh
+set -eu
+
+usage() {
+  cat <<'EOF'
+Usage:
+  winctl [--user USER] [--port PORT] [--identity KEY] HOST status
+  winctl [--user USER] [--port PORT] [--identity KEY] HOST display AC_MINUTES [DC_MINUTES]
+  winctl [--user USER] [--port PORT] [--identity KEY] HOST sleep AC_MINUTES [DC_MINUTES]
+
+The first connection deliberately asks you to verify the Windows SSH host key.
+EOF
+}
+
+remote_user=macremote
+remote_port=22
+identity_file=
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --user)
+      [ "$#" -ge 2 ] || { usage >&2; exit 64; }
+      remote_user=$2
+      shift 2
+      ;;
+    --port)
+      [ "$#" -ge 2 ] || { usage >&2; exit 64; }
+      remote_port=$2
+      shift 2
+      ;;
+    --identity)
+      [ "$#" -ge 2 ] || { usage >&2; exit 64; }
+      identity_file=$2
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      printf 'Unknown option: %s\n' "$1" >&2
+      usage >&2
+      exit 64
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+[ "$#" -ge 2 ] || { usage >&2; exit 64; }
+remote_host=$1
+action=$2
+shift 2
+
+is_minutes() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$1" -le 1440 ]
+}
+
+power_query_function='function Get-PowerValue([string]$SubGroup,[string]$Setting) { $text = (& powercfg.exe /query SCHEME_CURRENT $SubGroup $Setting 2>&1 | Out-String); if ($LASTEXITCODE -ne 0) { throw $text.Trim() }; $values = @([regex]::Matches($text, "0x([0-9a-fA-F]{8})") | ForEach-Object { [Convert]::ToInt64($_.Groups[1].Value, 16) }); [ordered]@{ acSeconds = $(if ($values.Count -gt 0) { $values[0] } else { $null }); dcSeconds = $(if ($values.Count -gt 1) { $values[1] } else { $null }) } }'
+
+case "$action" in
+  status)
+    [ "$#" -eq 0 ] || { usage >&2; exit 64; }
+    remote_script="$power_query_function; [ordered]@{ computerName = \$env:COMPUTERNAME; identity = (& whoami.exe); isAdministrator = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator); activeScheme = ((& powercfg.exe /getactivescheme) | Out-String).Trim(); display = Get-PowerValue 'SUB_VIDEO' 'VIDEOIDLE'; sleep = Get-PowerValue 'SUB_SLEEP' 'STANDBYIDLE' } | ConvertTo-Json -Depth 4"
+    ;;
+  display|sleep)
+    [ "$#" -ge 1 ] && [ "$#" -le 2 ] || { usage >&2; exit 64; }
+    ac_minutes=$1
+    dc_minutes=${2:-$1}
+    is_minutes "$ac_minutes" || { printf 'AC minutes must be 0..1440.\n' >&2; exit 64; }
+    is_minutes "$dc_minutes" || { printf 'DC minutes must be 0..1440.\n' >&2; exit 64; }
+    if [ "$action" = display ]; then
+      ac_setting=monitor-timeout-ac
+      dc_setting=monitor-timeout-dc
+      subgroup=SUB_VIDEO
+      setting=VIDEOIDLE
+    else
+      ac_setting=standby-timeout-ac
+      dc_setting=standby-timeout-dc
+      subgroup=SUB_SLEEP
+      setting=STANDBYIDLE
+    fi
+    remote_script="$power_query_function; & powercfg.exe /change '$ac_setting' $ac_minutes; if (\$LASTEXITCODE -ne 0) { throw 'powercfg AC update failed' }; & powercfg.exe /change '$dc_setting' $dc_minutes; if (\$LASTEXITCODE -ne 0) { throw 'powercfg DC update failed' }; [ordered]@{ status = 'updated'; setting = '$action'; requestedAcMinutes = $ac_minutes; requestedDcMinutes = $dc_minutes; effective = Get-PowerValue '$subgroup' '$setting' } | ConvertTo-Json -Depth 4"
+    ;;
+  *)
+    printf 'Unknown action: %s\n' "$action" >&2
+    usage >&2
+    exit 64
+    ;;
+esac
+
+encoded_command=$(printf '%s' "$remote_script" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\r\n')
+
+set -- \
+  -p "$remote_port" \
+  -o BatchMode=yes \
+  -o PasswordAuthentication=no \
+  -o PreferredAuthentications=publickey
+
+if [ -n "$identity_file" ]; then
+  set -- "$@" -o IdentitiesOnly=yes -i "$identity_file"
+fi
+
+exec ssh "$@" "$remote_user@$remote_host" \
+  powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand "$encoded_command"
