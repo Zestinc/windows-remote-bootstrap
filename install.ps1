@@ -468,14 +468,18 @@ function Get-SshKeygenExecutable {
     return $candidate
 }
 
-function Protect-OpenSshHostKeys {
+function Assert-OpenSshHostKeysProtected {
     $privateHostKeys = @(Get-ChildItem -LiteralPath $script:SshPath -Filter 'ssh_host_*_key' -File -ErrorAction SilentlyContinue)
     if ($privateHostKeys.Count -eq 0) {
         throw 'OpenSSH did not generate any private host keys.'
     }
     foreach ($hostKey in $privateHostKeys) {
-        Invoke-Icacls $hostKey.FullName '/setowner' '*S-1-5-18' '/inheritance:r' '/grant:r' `
-            '*S-1-5-18:F' '*S-1-5-32-544:F'
+        # The Windows sshd service creates its private host keys with a
+        # protected SYSTEM/Administrators ACL. Do not rewrite those
+        # service-owned files; fail closed if their ACL is unexpectedly broad.
+        if (-not (Test-ManagedFileAcl -Path $hostKey.FullName)) {
+            throw "OpenSSH private host key has an unexpected ACL: $($hostKey.FullName)"
+        }
     }
 }
 
@@ -675,7 +679,7 @@ function Install-WindowsRemoteBootstrap {
             } while (($privateHostKeys.Count -eq 0) -and ((Get-Date) -lt $hostKeyDeadline))
             Stop-Service -Name sshd -Force
         }
-        Protect-OpenSshHostKeys
+        Assert-OpenSshHostKeysProtected
 
         $backupDirectory = Join-Path $script:RootPath 'backup'
         [void](New-Item -Path $backupDirectory -ItemType Directory -Force)
