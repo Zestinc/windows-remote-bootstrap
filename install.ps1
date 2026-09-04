@@ -685,13 +685,17 @@ function Get-CompetingSshFirewallRules {
 
         $applicationFilter = $rule | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
         $program = if ($null -eq $applicationFilter) { 'Any' } else { [string]$applicationFilter.Program }
+        $package = if ($null -eq $applicationFilter) { 'Any' } else { [string]$applicationFilter.Package }
         $programExpanded = [Environment]::ExpandEnvironmentVariables($program).TrimEnd('\').ToLowerInvariant()
         $programApplies = ($program -eq 'Any') -or ($programExpanded -eq $targetProgram)
+        # Packaged-app rules cannot authorize an unpackaged sshd.exe, even when
+        # their Program filter is reported as Any.
+        $packageApplies = [string]::IsNullOrWhiteSpace($package) -or ($package -eq 'Any')
 
         $serviceFilter = $rule | Get-NetFirewallServiceFilter -ErrorAction SilentlyContinue
         $serviceName = if ($null -eq $serviceFilter) { 'Any' } else { [string]$serviceFilter.Service }
         $serviceApplies = ($serviceName -eq 'Any') -or ($serviceName -eq 'sshd')
-        if ($programApplies -and $serviceApplies) {
+        if ($programApplies -and $packageApplies -and $serviceApplies) {
             [void]$competing.Add([string]$rule.Name)
         }
     }
@@ -737,6 +741,8 @@ function Test-ManagedFirewallRule {
     }
     $applicationFilter = $rule | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
     if ($null -eq $applicationFilter) { return $false }
+    $package = [string]$applicationFilter.Package
+    if (-not ([string]::IsNullOrWhiteSpace($package) -or ($package -eq 'Any'))) { return $false }
     $actualProgram = [Environment]::ExpandEnvironmentVariables([string]$applicationFilter.Program)
     if ([IO.Path]::GetFullPath($actualProgram).TrimEnd('\') -ine [IO.Path]::GetFullPath($SshdExe).TrimEnd('\')) {
         return $false
@@ -1079,6 +1085,13 @@ function Undo-InstallTransaction {
 
     $account = Get-LocalUser -Name ([string]$Transaction.accountName) -ErrorAction SilentlyContinue
     if ($null -ne $account) {
+        if ([string]::IsNullOrWhiteSpace([string]$Transaction.accountSid) -and
+            ([string]$account.Description -eq [string]$Transaction.accountMarker)) {
+            # A hard stop can happen after New-LocalUser succeeds but before the
+            # SID is journaled. The unguessable marker safely reconnects it.
+            $Transaction.accountSid = [string]$account.SID.Value
+            Update-InstallTransaction -Transaction $Transaction
+        }
         $sidMatches = -not [string]::IsNullOrWhiteSpace([string]$Transaction.accountSid) -and
             ([string]$account.SID.Value -eq [string]$Transaction.accountSid)
         if ($sidMatches -and ([string]$account.Description -eq [string]$Transaction.accountMarker)) {
@@ -1473,9 +1486,10 @@ function Invoke-WindowsRemoteBootstrapAudit {
     Add-AuditCheck 'firewall-profiles-enabled' $profilesOk ([string]$profilesOk)
     Add-AuditCheck 'no-competing-firewall-rule' ($competing.Count -eq 0) ($competing -join ', ')
 
-    $defaultRule = Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue
-    $defaultRuleOk = ($null -eq $defaultRule) -or ([string]$defaultRule.Enabled -ne 'True')
-    Add-AuditCheck 'default-wide-firewall-disabled' $defaultRuleOk $(if ($null -eq $defaultRule) { 'absent' } else { [string]$defaultRule.Enabled })
+    $defaultRules = @(Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)
+    $enabledDefaultRules = @($defaultRules | Where-Object { [string]$_.Enabled -eq 'True' })
+    $defaultRuleOk = $enabledDefaultRules.Count -eq 0
+    Add-AuditCheck 'default-wide-firewall-disabled' $defaultRuleOk $(if ($defaultRules.Count -eq 0) { 'absent' } else { (@($defaultRules.Enabled) -join ',') })
 
     $originalConfigOk = $true
     if ([bool]$state.original.config.existed) {
