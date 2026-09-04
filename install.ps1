@@ -751,6 +751,11 @@ function Get-CompetingSshFirewallRules {
         Where-Object { $_.Name -notin @($script:FirewallRuleName, 'OpenSSH-Server-In-TCP') })
     foreach ($rule in $rules) {
         $enforcement = @($rule.EnforcementStatus | ForEach-Object { [string]$_ })
+        $packageFamilyProperty = $rule.PSObject.Properties['PackageFamilyName']
+        $packageFamilyName = if ($null -eq $packageFamilyProperty) { '' } else { [string]$packageFamilyProperty.Value }
+        if (-not [string]::IsNullOrWhiteSpace($packageFamilyName)) {
+            continue
+        }
         # ActiveStore can retain packaged-app capability rules whose hidden app
         # identity currently cannot resolve. Such a rule cannot match sshd.exe.
         if (($enforcement -contains 'ApplicationResolutionEmpty') -or ($enforcement -contains '11')) {
@@ -1210,11 +1215,6 @@ function New-InstallTransaction {
     $hostKeySnapshot = @(Get-HostKeyFileRecords)
     $sshdPath = Join-Path $env:SystemRoot 'System32\OpenSSH\sshd.exe'
     $existingWithoutCapability = ($capability.State -ne 'Installed') -and [bool]$serviceSnapshot.existed
-    if (($capability.State -ne 'Installed') -and
-        (([bool]$configSnapshot.existed -or [bool]$sshDirectorySnapshot.existed -or $hostKeySnapshot.Count -gt 0) -and
-            (-not $existingWithoutCapability))) {
-        throw 'OpenSSH files exist without either the Windows capability or an existing sshd service; refusing an ambiguous takeover.'
-    }
     if ($existingWithoutCapability -and (-not (Test-Path -LiteralPath $sshdPath -PathType Leaf))) {
         throw 'An existing sshd service does not use the supported in-box System32 location.'
     }

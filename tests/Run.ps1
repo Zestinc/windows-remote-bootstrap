@@ -36,20 +36,6 @@ function Invoke-Installer {
 
 [void](New-Item -Path $testRoot -ItemType Directory -Force)
 try {
-    if ([string]$env:GITHUB_ACTIONS -eq 'true') {
-        $capabilityRule = Get-NetFirewallRule -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like '*-In-Allow-ServerCapability' } |
-            Select-Object -First 1
-        if ($null -ne $capabilityRule) {
-            Write-Output '=== SERVER_CAPABILITY_RULE_DIAGNOSTIC ==='
-            $capabilityRule | Format-List *
-            $capabilityRule | Get-NetFirewallApplicationFilter | Format-List *
-            $capabilityRule | Get-NetFirewallSecurityFilter | Format-List *
-            $capabilityRule | Get-NetFirewallInterfaceFilter | Format-List *
-            $capabilityRule | Get-NetFirewallInterfaceTypeFilter | Format-List *
-        }
-    }
-
     $sshKeygen = Join-Path $env:SystemRoot 'System32\OpenSSH\ssh-keygen.exe'
     if (-not (Test-Path -LiteralPath $sshKeygen)) {
         $client = Get-WindowsCapability -Online -Name 'OpenSSH.Client~~~~0.0.1.0'
