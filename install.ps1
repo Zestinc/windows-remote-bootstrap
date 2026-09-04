@@ -397,6 +397,61 @@ $script:UserEnd
     return $globalBlock + $clean.TrimEnd() + "`r`n`r`n" + $userBlock
 }
 
+function Test-ManagedPolicyText {
+    param(
+        [Parameter(Mandatory = $true)][string]$Text,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][int]$SshPort
+    )
+
+    $globalPattern = '(?ms)^' + [regex]::Escape($script:GlobalBegin) + '(.*?)^' + [regex]::Escape($script:GlobalEnd)
+    $userPattern = '(?ms)^' + [regex]::Escape($script:UserBegin) + '(.*?)^' + [regex]::Escape($script:UserEnd)
+    $globalMatch = [regex]::Match($Text, $globalPattern)
+    $userMatch = [regex]::Match($Text, $userPattern)
+    if (-not $globalMatch.Success -or -not $userMatch.Success) {
+        return $false
+    }
+    if ($globalMatch.Index -ne 0 -or $userMatch.Index -le $globalMatch.Index) {
+        return $false
+    }
+
+    $global = $globalMatch.Groups[1].Value.ToLowerInvariant()
+    $user = $userMatch.Groups[1].Value.ToLowerInvariant()
+    $requiredGlobal = @(
+        "port $SshPort",
+        'pubkeyauthentication yes',
+        'passwordauthentication no',
+        'authenticationmethods publickey',
+        'permitemptypasswords no',
+        "allowusers $Name",
+        'maxauthtries 3'
+    )
+    $requiredUser = @(
+        "match user $Name",
+        "authorizedkeysfile __programdata__/$($script:ProgramName.ToLowerInvariant())/authorized_keys",
+        'passwordauthentication no',
+        'authenticationmethods publickey',
+        'allowagentforwarding no',
+        'allowtcpforwarding no'
+    )
+    foreach ($required in $requiredGlobal) {
+        if (-not $global.Contains($required.ToLowerInvariant())) {
+            return $false
+        }
+    }
+    foreach ($required in $requiredUser) {
+        if (-not $user.Contains($required.ToLowerInvariant())) {
+            return $false
+        }
+    }
+
+    # The dedicated user Match must be the first active Match block. OpenSSH uses
+    # the first matching value, so the later Windows administrator-group default
+    # cannot redirect this account to administrators_authorized_keys.
+    $firstMatch = [regex]::Match($Text, '(?im)^\s*Match\s+')
+    return $firstMatch.Success -and ($firstMatch.Index -ge $userMatch.Index) -and ($firstMatch.Index -lt ($userMatch.Index + $userMatch.Length))
+}
+
 function Get-SshdExecutable {
     $candidate = Join-Path $env:SystemRoot 'System32\OpenSSH\sshd.exe'
     if (-not (Test-Path -LiteralPath $candidate)) {
@@ -588,9 +643,15 @@ function Install-WindowsRemoteBootstrap {
         }
 
         if (-not (Test-Path -LiteralPath $script:SshConfigPath)) {
+            $defaultConfig = Join-Path $env:SystemRoot 'System32\OpenSSH\sshd_config_default'
+            if (-not (Test-Path -LiteralPath $defaultConfig)) {
+                throw "OpenSSH default configuration was not found at $defaultConfig."
+            }
+            Copy-Item -LiteralPath $defaultConfig -Destination $script:SshConfigPath -Force
             & (Get-SshKeygenExecutable) -A | Out-Null
-            Start-Service -Name sshd
-            Stop-Service -Name sshd
+            if ($LASTEXITCODE -ne 0) {
+                throw 'OpenSSH could not generate host keys.'
+            }
         }
         if (-not (Test-Path -LiteralPath $script:SshConfigPath)) {
             throw 'OpenSSH did not create sshd_config.'
@@ -644,20 +705,9 @@ function Install-WindowsRemoteBootstrap {
             throw "sshd is running but TCP/$SshPort is not listening."
         }
 
-        $effective = & $sshdExe -T -f $script:SshConfigPath -C "user=$Name,host=localhost,addr=127.0.0.1" 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw "Unable to inspect effective sshd settings: $($effective -join ' ')"
-        }
-        $effectiveText = ($effective -join "`n").ToLowerInvariant()
-        foreach ($required in @(
-            'passwordauthentication no',
-            'authenticationmethods publickey',
-            "allowusers $Name",
-            "authorizedkeysfile __programdata__/$($script:ProgramName.ToLowerInvariant())/authorized_keys"
-        )) {
-            if (-not $effectiveText.Contains($required.ToLowerInvariant())) {
-                throw "Effective sshd configuration is missing: $required"
-            }
+        $activeConfigText = Get-Content -LiteralPath $script:SshConfigPath -Raw
+        if (-not (Test-ManagedPolicyText -Text $activeConfigText -Name $Name -SshPort $SshPort)) {
+            throw 'Managed sshd policy is missing or is ordered after another Match block.'
         }
 
         $state = [ordered]@{
@@ -704,7 +754,7 @@ function Install-WindowsRemoteBootstrap {
             verification = [ordered]@{
                 openSshCapability = 'Installed'
                 sshdConfigSyntax = 'valid'
-                sshdEffectivePolicy = 'key-only/dedicated-user-keyfile'
+                sshdPolicyOrder = 'key-only/dedicated-user-keyfile/first-match'
                 sshdService = 'Running/Automatic'
                 tcpListener = "TCP/$SshPort"
                 firewall = 'enabled/restricted'
@@ -789,26 +839,20 @@ function Invoke-WindowsRemoteBootstrapAudit {
     Add-AuditCheck 'state-acl' (Test-ManagedFileAcl -Path $script:StatePath) 'SYSTEM and Administrators only'
 
     $configOk = $false
-    $effectiveOk = $false
+    $policyOk = $false
     if (Test-Path -LiteralPath $script:SshConfigPath) {
         try {
             $sshdExe = Get-SshdExecutable
             Test-SshConfig -Path $script:SshConfigPath -SshdExe $sshdExe
             $configOk = $true
-            $effective = & $sshdExe -T -f $script:SshConfigPath -C "user=$($state.accountName),host=localhost,addr=127.0.0.1" 2>&1
-            if ($LASTEXITCODE -eq 0) {
-                $effectiveText = ($effective -join "`n").ToLowerInvariant()
-                $effectiveOk = $effectiveText.Contains('passwordauthentication no') -and
-                    $effectiveText.Contains('authenticationmethods publickey') -and
-                    $effectiveText.Contains("allowusers $([string]$state.accountName)") -and
-                    $effectiveText.Contains("authorizedkeysfile __programdata__/$($script:ProgramName.ToLowerInvariant())/authorized_keys")
-            }
+            $activeConfigText = Get-Content -LiteralPath $script:SshConfigPath -Raw
+            $policyOk = Test-ManagedPolicyText -Text $activeConfigText -Name ([string]$state.accountName) -SshPort ([int]$state.port)
         } catch {
             $configOk = $false
         }
     }
     Add-AuditCheck 'sshd-config-syntax' $configOk ([string]$configOk)
-    Add-AuditCheck 'sshd-effective-policy' $effectiveOk ([string]$effectiveOk)
+    Add-AuditCheck 'sshd-policy-order' $policyOk ([string]$policyOk)
 
     $service = Get-Service -Name sshd -ErrorAction SilentlyContinue
     $serviceOk = ($null -ne $service) -and ($service.Status -eq 'Running')
