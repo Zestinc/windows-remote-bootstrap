@@ -478,7 +478,7 @@ function Assert-SafeExistingSshBaseline {
         }
         $protectedInputs += Get-Item -LiteralPath $script:SshConfigPath -Force
     }
-    $hostKeyInputs = @(Get-ChildItem -LiteralPath $script:SshPath -Filter 'ssh_host_*' -Force -ErrorAction SilentlyContinue)
+    $hostKeyInputs = @(Get-ChildItem -LiteralPath $script:SshPath -Filter 'ssh_host_*' -Force -ErrorAction Stop)
     foreach ($hostKeyInput in $hostKeyInputs) {
         if ($hostKeyInput.PSIsContainer) {
             throw "An OpenSSH host-key-shaped path is not a regular file: $($hostKeyInput.FullName)"
@@ -1402,7 +1402,7 @@ function Get-CompetingSshFirewallRules {
         Where-Object {
             ([string]$_.Enabled -eq 'True') -and
             ([string]$_.Direction -eq 'Inbound') -and
-            ([string]$_.Action -in @('Allow', 'Block')) -and
+            ([string]$_.Action -in @('Allow', 'AllowBypass', 'Block', '2', '3', '4')) -and
             ($_.Name -notin @($script:FirewallRuleName, 'OpenSSH-Server-In-TCP'))
         })
     foreach ($rule in $rules) {
@@ -1586,7 +1586,7 @@ function Get-HostKeyFileRecords {
     if (Test-ReparsePoint -Path $script:SshPath) {
         throw 'OpenSSH host-key directory is a reparse point.'
     }
-    $items = @(Get-ChildItem -LiteralPath $script:SshPath -Filter 'ssh_host_*' -Force -ErrorAction SilentlyContinue)
+    $items = @(Get-ChildItem -LiteralPath $script:SshPath -Filter 'ssh_host_*' -Force -ErrorAction Stop)
     return @($items | Sort-Object Name | ForEach-Object {
             if (([IO.Path]::GetFileName($_.Name) -ne $_.Name) -or
                 ($_.Name -notmatch '^ssh_host_[A-Za-z0-9._-]+$') -or
@@ -3120,9 +3120,11 @@ function Complete-RootRetirement {
         throw 'A cleanup retirement path already exists for this transaction.'
     }
     [IO.Directory]::Move($script:RootPath, $retiring)
+    Invoke-TestHook -Stage 'cleanup-root-after-freeze'
     $frozenRecord = Get-CleanupRecordFromFrozenRoot -Path $retiring -ExpectedId $id
     Assert-CleanupRootReadyForRetirement -Path $retiring -Record $frozenRecord
     [IO.Directory]::Move($retiring, $tombstone)
+    Invoke-TestHook -Stage 'cleanup-root-after-commit'
     Remove-CleanupTombstone -Path $tombstone
 }
 

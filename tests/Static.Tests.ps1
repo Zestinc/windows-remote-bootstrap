@@ -18,7 +18,9 @@ $required = @(
     "Test-EffectiveSshPolicy",
     "managedConfigSha256",
     "hostKeyFingerprint",
-    "Set-ExactAcl"
+    "Set-ExactAcl",
+    "AllowBypass",
+    "Language.NullString]::Value"
 )
 foreach ($needle in $required) {
     if (-not $text.Contains($needle)) {
@@ -38,6 +40,13 @@ foreach ($needle in $forbidden) {
     if ($text.Contains($needle)) {
         throw "Forbidden security pattern found: $needle"
     }
+}
+
+if ($text -match '(?m)\[IO\.File\]::Replace\([^\r\n]*,\s*\$null\s*\)') {
+    throw 'File.Replace must use AutomationNull, not a PowerShell null argument.'
+}
+if ($text -match '(?m)\(Get-OptionalPropertyValues[^\r\n]*\)\.Count') {
+    throw 'Optional property values must be array-wrapped before reading Count in PowerShell 5.1.'
 }
 
 Write-Output 'Static security tests passed.'

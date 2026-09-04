@@ -95,7 +95,7 @@ function Get-PathSnapshot {
 }
 
 function Get-HostKeySnapshots {
-    return @(Get-ChildItem -LiteralPath $sshRoot -Filter 'ssh_host_*' -Force -ErrorAction SilentlyContinue |
+    return @(Get-ChildItem -LiteralPath $sshRoot -Filter 'ssh_host_*' -Force -ErrorAction Stop |
         Sort-Object Name | ForEach-Object {
             if ($_.PSIsContainer) { throw "Unexpected host-key directory: $($_.FullName)" }
             [ordered]@{
@@ -174,6 +174,10 @@ function Assert-BaselineExact {
     } else { @() }
     Assert-True (-not (Test-Path -LiteralPath $managedRoot)) `
         "$Context left the managed root; children=$($rootDiagnostic -join ',')"
+    $cleanupRoots = @(Get-ChildItem -LiteralPath $env:ProgramData `
+            -Filter '.WindowsRemoteBootstrap.ret*' -Force -ErrorAction Stop)
+    Assert-True ($cleanupRoots.Count -eq 0) `
+        "$Context left cleanup roots: $(@($cleanupRoots | ForEach-Object { $_.Name }) -join ',')"
 }
 
 function Invoke-InstallerRaw {
@@ -243,8 +247,19 @@ function Test-SshSession {
     $badArguments = @($arguments)
     $identityIndex = [Array]::IndexOf($badArguments, $clientKey)
     $badArguments[$identityIndex] = $unauthorizedKey
-    [void](& $ssh @badArguments 'whoami.exe' 2>&1)
-    Assert-True ($LASTEXITCODE -ne 0) 'an unauthorized SSH key was accepted'
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        # Windows PowerShell 5.1 turns a native process' expected stderr into a
+        # NativeCommandError when the suite runs with Stop.  This connection is
+        # intentionally rejected, so capture only its process exit status.
+        $ErrorActionPreference = 'Continue'
+        [void](& $ssh @badArguments 'whoami.exe' 2>&1)
+        $badKeyExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    Assert-True ($badKeyExitCode -ne 0) 'an unauthorized SSH key was accepted'
 }
 
 function Initialize-Fixture {
@@ -334,6 +349,20 @@ try {
             Assert-Result $failed 1 'failed' "throw recovery $stage"
             Write-Output "throw recovery $stage reported: $([string]$failed.Receipt.error)"
             Assert-BaselineExact -Expected $baseline -Context "throw recovery $stage"
+        }
+
+        foreach ($retirementStage in @('cleanup-root-after-freeze', 'cleanup-root-after-commit')) {
+            # Combine a normal injected forward failure with a hard kill during
+            # rollback. The next process must recognize either the frozen root
+            # or committed tombstone and finish cleanup without guessing.
+            $crashedRetirement = Invoke-InstallerRaw -Arguments $installArguments `
+                -ThrowAfter 'account-before-sid-journal' -CrashAfter $retirementStage
+            Assert-True (($crashedRetirement.ExitCode -ne 0) -and
+                (-not $crashedRetirement.ReceiptExists)) `
+                "$retirementStage hard crash did not terminate cleanup"
+            $retirementRetry = Invoke-InstallerRaw -Arguments @('-Mode', 'Uninstall')
+            Assert-Result $retirementRetry 0 'already-uninstalled' "$retirementStage retry"
+            Assert-BaselineExact -Expected $baseline -Context "$retirementStage recovery"
         }
 
         $crashedAccount = Invoke-InstallerRaw -Arguments $installArguments -CrashAfter 'account-before-sid-journal'
