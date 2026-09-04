@@ -477,7 +477,8 @@ function Test-RawFileSystemAllowAces {
         return $false
     }
     foreach ($ace in $Descriptor.DiscretionaryAcl) {
-        if (($ace.AceFlags -band [Security.AccessControl.AceFlags]::InheritOnly) -ne 0) {
+        if ((([int]$ace.AceFlags) -band
+                ([int][Security.AccessControl.AceFlags]::InheritOnly)) -ne 0) {
             continue
         }
         if (($ace -isnot [Security.AccessControl.CommonAce]) -or $ace.IsCallback) {
