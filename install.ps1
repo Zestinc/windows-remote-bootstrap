@@ -39,6 +39,7 @@ $script:SshOwnershipMarkerName = '.WindowsRemoteBootstrap.owner'
 $script:GlobalBegin = '# BEGIN WINDOWS-REMOTE-BOOTSTRAP MANAGED CONFIG'
 $script:GlobalEnd = '# END WINDOWS-REMOTE-BOOTSTRAP MANAGED CONFIG'
 $script:ManagedHostKeyTypes = @('dsa', 'rsa', 'ecdsa', 'ed25519')
+$script:LastSecurityBoundaryError = ''
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:InstallPhases = @(
     'created',
@@ -470,6 +471,7 @@ function Test-RawFileSystemAllowAces {
     if (($Descriptor.ControlFlags -band
             [Security.AccessControl.ControlFlags]::DiscretionaryAclPresent) -eq 0 -or
         ($null -eq $Descriptor.DiscretionaryAcl)) {
+        $script:LastSecurityBoundaryError = 'security descriptor has no present, non-null DACL'
         return $false
     }
     foreach ($ace in $Descriptor.DiscretionaryAcl) {
@@ -477,22 +479,33 @@ function Test-RawFileSystemAllowAces {
             continue
         }
         if (($ace -isnot [Security.AccessControl.CommonAce]) -or $ace.IsCallback) {
+            $script:LastSecurityBoundaryError = "unsupported or callback ACE: $($ace.GetType().FullName)"
             return $false
         }
         if ($ace.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessDenied) {
             continue
         }
         if ($ace.AceQualifier -ne [Security.AccessControl.AceQualifier]::AccessAllowed) {
+            $script:LastSecurityBoundaryError = "unsupported ACE qualifier: $($ace.AceQualifier)"
             return $false
         }
         $sid = $null
-        try { $sid = [string]$ace.SecurityIdentifier.Value } catch { return $false }
-        if ([string]::IsNullOrWhiteSpace($sid)) { return $false }
+        try { $sid = [string]$ace.SecurityIdentifier.Value } catch {
+            $script:LastSecurityBoundaryError = 'an ACE has no parseable SID'
+            return $false
+        }
+        if ([string]::IsNullOrWhiteSpace($sid)) {
+            $script:LastSecurityBoundaryError = 'an ACE has an empty SID'
+            return $false
+        }
         if (Test-TrustedSidForSecurityBoundary -Sid $sid -FixedTrustedOnly $FixedTrustedOnly) {
             continue
         }
         $mask = ConvertTo-UnsignedAccessMask -AccessMask ([int]$ace.AccessMask)
-        if (($mask -band $UnsafeMask) -ne 0) { return $false }
+        if (($mask -band $UnsafeMask) -ne 0) {
+            $script:LastSecurityBoundaryError = ('untrusted allow ACE SID={0} mask=0x{1:x8}' -f $sid, $mask)
+            return $false
+        }
     }
     return $true
 }
@@ -508,12 +521,14 @@ function Test-PathProtectedFromUntrustedMutation {
         return $false
     }
     try {
+        $script:LastSecurityBoundaryError = ''
         $acl = Get-Acl -LiteralPath $Path
         $raw = New-Object -TypeName Security.AccessControl.RawSecurityDescriptor -ArgumentList (,$acl.Sddl)
         $ownerSid = ConvertTo-SidValue -IdentityReference $acl.Owner
         if ([string]::IsNullOrWhiteSpace($ownerSid) -or
             (-not (Test-TrustedSidForSecurityBoundary -Sid $ownerSid `
                     -FixedTrustedOnly $FixedTrustedOnly))) {
+            $script:LastSecurityBoundaryError = "untrusted or unreadable owner SID on '$Path': '$ownerSid'"
             return $false
         }
 
@@ -528,6 +543,7 @@ function Test-PathProtectedFromUntrustedMutation {
         return Test-RawFileSystemAllowAces -Descriptor $raw -UnsafeMask $unsafeMask `
             -FixedTrustedOnly $FixedTrustedOnly
     } catch {
+        $script:LastSecurityBoundaryError = "ACL query failed for '$Path': $($_.Exception.Message)"
         return $false
     }
 }
@@ -544,12 +560,14 @@ function Test-ParentProtectsChildFromUntrustedReplacement {
         return $false
     }
     try {
+        $script:LastSecurityBoundaryError = ''
         $acl = Get-Acl -LiteralPath $parent
         $raw = New-Object -TypeName Security.AccessControl.RawSecurityDescriptor -ArgumentList (,$acl.Sddl)
         $ownerSid = ConvertTo-SidValue -IdentityReference $acl.Owner
         if ([string]::IsNullOrWhiteSpace($ownerSid) -or
             (-not (Test-TrustedSidForSecurityBoundary -Sid $ownerSid `
                     -FixedTrustedOnly $FixedTrustedOnly))) {
+            $script:LastSecurityBoundaryError = "untrusted or unreadable owner SID on '$parent': '$ownerSid'"
             return $false
         }
         # A parent may allow an untrusted user to create unrelated siblings;
@@ -559,6 +577,7 @@ function Test-ParentProtectsChildFromUntrustedReplacement {
         return Test-RawFileSystemAllowAces -Descriptor $raw `
             -UnsafeMask $unsafeReplacementMask -FixedTrustedOnly $FixedTrustedOnly
     } catch {
+        $script:LastSecurityBoundaryError = "ACL query failed for '$parent': $($_.Exception.Message)"
         return $false
     }
 }
@@ -930,7 +949,7 @@ function Assert-SupportedEnvironment {
     }
     foreach ($managedChild in @($script:RootPath, $script:CleanupRootPath, $script:SshPath)) {
         if (-not (Test-ParentProtectsChildFromUntrustedReplacement -ChildPath $managedChild)) {
-            throw "The canonical parent can expose a managed path to untrusted replacement: $managedChild"
+            throw "The canonical parent can expose a managed path to untrusted replacement: $managedChild; $script:LastSecurityBoundaryError"
         }
     }
 
