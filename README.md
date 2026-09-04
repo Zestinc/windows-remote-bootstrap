@@ -1,94 +1,171 @@
 # Windows Remote Bootstrap
 
+> **Development status:** v1.0.0 has not been released. The hash placeholders
+> below are intentionally non-executable. Do not use the install commands until
+> the exact release commit passes every Windows CI job, the placeholders are
+> replaced, and the immutable GitHub Release is published and independently
+> verified.
+
 A dependency-free Windows PowerShell 5.1 bootstrapper for secure administration
-from macOS. It installs the Windows OpenSSH optional capability, creates one
-dedicated local administrator, accepts only explicitly supplied public keys,
-and limits the SSH firewall rule to explicitly supplied source addresses.
+from macOS. It installs the in-box Windows OpenSSH Server when needed, creates
+one dedicated local administrator, accepts only the supplied public keys, and
+limits the SSH firewall rule to the supplied source addresses.
 
 It does **not** install a custom daemon, enable WinRM, disable UAC, expose a
-router port, store private keys, or use Windows' shared
-`administrators_authorized_keys` file.
+router port, store private keys, use Windows'
+`administrators_authorized_keys`, or bypass WDAC, AppLocker, Constrained
+Language Mode, or other system policy.
 
 ## Requirements
 
 - Windows 10 build 1809 or newer, or Windows 11.
 - An account that can approve one UAC prompt.
-- Windows PowerShell 5.1 and internet access to Windows Update for the OpenSSH
-  optional capability when it is not already installed.
-- Windows 11 Administrator Protection must not be enabled. The installer checks
-  this and stops instead of weakening that protection.
+- Elevated 64-bit Windows PowerShell 5.1.
+- Internet access to Windows Update if OpenSSH Server is not already installed.
+- Windows 11 Administrator Protection must not be enabled. The installer stops
+  instead of weakening that protection.
 
-## Installation
+## Install on Windows
 
-Use a versioned GitHub Release asset and verify its documented SHA-256 before
-execution. Pass each macOS public key as Base64-encoded UTF-8 and set the exact
-LAN, host IPs, or `LocalSubnet` that may connect.
-
-Example (replace the placeholder with a Base64-encoded public key):
+Open **64-bit Windows PowerShell as Administrator** and paste this complete
+block. It launches a separate Windows PowerShell process, downloads the
+versioned asset once as bytes, hashes those exact bytes, decodes them as strict
+UTF-8, and executes only the verified script in memory.
 
 ```powershell
-$url = 'https://github.com/Zestinc/windows-remote-bootstrap/releases/download/v1.0.0/install.ps1'
-$path = Join-Path $env:TEMP 'windows-remote-bootstrap-v1.0.0.ps1'
-Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $path
-$actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
-$expected = '3623989524e1a48cc87f7083eb2a0daf221c63f18f9e3100a19315f4d3c10aa6'
-if ($actual -ne $expected) { Remove-Item $path -Force; throw "SHA-256 mismatch: $actual" }
-& $path -AuthorizedKeyBase64 '<BASE64_PUBLIC_KEY>' -AllowedRemoteAddress 'LocalSubnet'
+& {
+    $ErrorActionPreference = 'Stop'
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw 'Run 64-bit Windows PowerShell as Administrator.'
+    }
+    if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+        throw 'Use System32 Windows PowerShell, not SysWOW64 Windows PowerShell.'
+    }
+
+    $loader = @'
+$ErrorActionPreference = 'Stop'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$uri = 'https://github.com/Zestinc/windows-remote-bootstrap/releases/download/v1.0.0/install.ps1'
+$expected = '__FINAL_INSTALL_SHA256__'
+$keys = @(
+    'c3NoLWVkMjU1MTkgQUFBQUMzTnphQzFsWkRJMU5URTVBQUFBSUdSVTVWWi9nalJhZUpyNnRlNzlseEhPM3lzeWFaWDVDcUZkZ3EybEI1Zk0gbWFjbWluaS0yMDI2',
+    'c3NoLWVkMjU1MTkgQUFBQUMzTnphQzFsWkRJMU5URTVBQUFBSUVJZWMrRTlSazRqSzd2KytTUGR1QVF6Y296cGh5bnI5eGRwUjNFRGRkdDUgbWJwLTIwMjY='
+)
+$client = New-Object System.Net.WebClient
+try {
+    $client.Headers['User-Agent'] = 'WindowsRemoteBootstrap/1.0.0'
+    [byte[]]$bytes = $client.DownloadData($uri)
+} finally {
+    $client.Dispose()
+}
+$sha = [Security.Cryptography.SHA256]::Create()
+try {
+    $actual = ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant()
+} finally {
+    $sha.Dispose()
+}
+if (-not [string]::Equals($actual, $expected, [StringComparison]::Ordinal)) {
+    throw "SHA-256 mismatch: $actual"
+}
+$utf8 = New-Object System.Text.UTF8Encoding($false, $true)
+$source = $utf8.GetString($bytes)
+& ([ScriptBlock]::Create($source)) `
+    -Mode Install `
+    -AuthorizedKeyBase64 $keys `
+    -AccountName 'macremote' `
+    -Port 22 `
+    -AllowedRemoteAddress @('LocalSubnet')
+'@
+
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($loader))
+    $system = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)
+    $windowsPowerShell = Join-Path $system 'WindowsPowerShell\v1.0\powershell.exe'
+    & $windowsPowerShell -NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded
+    $code = $LASTEXITCODE
+    if ($code -eq 3) {
+        Write-Warning 'Restart Windows, then rerun this exact complete block.'
+    } elseif ($code -ne 0) {
+        throw "Windows Remote Bootstrap failed with exit code $code. Read its receipt above."
+    }
+}
 ```
 
-The installer is idempotent. If OpenSSH Server was already configured by
-something else, it refuses to replace that access policy unless
-`-TakeOverExistingSshd` is explicitly present. The previous configuration is
-backed up for uninstall and rollback.
+The only machine-readable result line starts exactly with
+`WINDOWS_REMOTE_BOOTSTRAP_RECEIPT_JSON=`. Keep the JSON after that prefix. A
+successful install reports `status: "installed"`, the Windows LAN addresses in
+`ipv4`, and the server fingerprint in `ssh.hostKeyFingerprint`. Exit code `3`
+means Windows must be restarted; after restart, rerun the exact complete block.
+The installer is idempotent.
+
+On the first SSH connection, accept the key **only if** the ED25519 fingerprint
+shown by `ssh` is byte-for-byte identical to `ssh.hostKeyFingerprint` in that
+receipt. Do not accept a merely similar fingerprint.
+
+If OpenSSH Server was already configured by something else, installation stops
+instead of replacing its policy. Deliberate takeover requires the explicit
+`-TakeOverExistingSshd` switch and preserves the prior configuration for
+rollback.
 
 ## What gets changed
 
-- Windows optional capability: `OpenSSH.Server~~~~0.0.1.0` when missing.
-- Local account: `macremote` by default, with an undisclosed random password.
-- SSH: public-key only, only the dedicated account, no agent or TCP forwarding.
+- Windows optional capability: `OpenSSH.Server~~~~0.0.1.0`, only when missing.
+- Local account: `macremote`, with an undisclosed random password.
+- SSH: public-key only, one dedicated account, no agent or TCP forwarding.
 - Key file: `%ProgramData%\WindowsRemoteBootstrap\authorized_keys`, protected
-  so only SYSTEM and local Administrators can modify it.
-- Firewall: one program-owned inbound rule; the default broad OpenSSH rule is
-  disabled.
+  so only trusted system principals can modify it.
+- Firewall: one program-owned inbound TCP/22 rule limited to `LocalSubnet`; the
+  default broad OpenSSH rule is disabled.
 - State and rollback data: `%ProgramData%\WindowsRemoteBootstrap`.
-- Machine-readable operation receipt: one prefixed JSON record on standard output.
 
 ## Audit and uninstall
 
-Run the downloaded, hash-verified script from an elevated Windows PowerShell:
+Use the same versioned, SHA-256-verified, strict-UTF-8 in-memory launcher, but
+invoke the verified script with `-Mode Audit` or `-Mode Uninstall`. Audit exits
+`0` only for a compliant state and `2` for drift. Uninstall automatically
+removes OpenSSH Server only when the protected receipt proves this tool
+installed it; a capability that existed before installation is retained.
 
-```powershell
-.\install.ps1 -Mode Audit
-.\install.ps1 -Mode Uninstall
-```
+## Install and use `winctl` on macOS
 
-OpenSSH itself is retained by default. Add `-RemoveOpenSshCapability` to
-uninstall only when the receipt proves this tool installed it.
-
-## macOS control helper
-
-`winctl` uses only utilities included with macOS (`ssh`, `iconv`, and `base64`).
-It never suppresses first-connection host-key verification.
+`winctl` requires only `/bin/sh`, `ssh`, `iconv`, `base64`, and `tr` at runtime.
+It deliberately keeps first-connection host-key verification enabled.
 
 ```bash
-curl -fL -o winctl https://github.com/Zestinc/windows-remote-bootstrap/releases/download/v1.0.0/winctl
-printf '%s  %s\n' e8a7f37f3a00ed1934a78a3f63006a15af895ad14c65c04211815406ad386760 winctl | shasum -a 256 -c -
-chmod +x winctl
-./winctl 192.168.1.50 status
-./winctl 192.168.1.50 display 15 5
-./winctl 192.168.1.50 sleep 60 30
+(
+  set -eu
+  wrb_tmp=$(mktemp -d)
+  trap 'rm -rf "$wrb_tmp"' 0 1 2 15
+  curl --fail --location \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    -o "$wrb_tmp/winctl" \
+    https://github.com/Zestinc/windows-remote-bootstrap/releases/download/v1.0.0/winctl
+  printf '%s  %s\n' '__FINAL_WINCTL_SHA256__' "$wrb_tmp/winctl" | shasum -a 256 -c -
+  mkdir -p "$HOME/.local/bin"
+  install -m 700 "$wrb_tmp/winctl" "$HOME/.local/bin/winctl"
+)
 ```
 
-The two display values are AC and battery minutes. `0` means never. Display
-timeout and system sleep are separate settings.
+After making the exact first-connection fingerprint comparison described above:
+
+```bash
+$HOME/.local/bin/winctl --identity "$HOME/.ssh/id_ed25519" <WINDOWS_LAN_IP> status
+$HOME/.local/bin/winctl --identity "$HOME/.ssh/id_ed25519" <WINDOWS_LAN_IP> display 15 5
+$HOME/.local/bin/winctl --identity "$HOME/.ssh/id_ed25519" <WINDOWS_LAN_IP> sleep 60 30
+```
+
+Display and sleep values are AC and battery minutes; if the second value is
+omitted it equals the first. `0` means never. The helper reads settings back and
+fails if Windows did not apply the requested values.
 
 ## Verification boundary
 
-CI validates PowerShell 5.1 parsing, a real OpenSSH installation, a key-only
-localhost login, an elevated remote token, `powercfg`, idempotency, audit, and
-uninstall on Windows Server runners. The receipt verifies service, effective
-sshd policy, listener, firewall, and host-key fingerprint. Actual LAN
-reachability still must be verified from an authorized Mac after installation.
+CI validates Windows PowerShell 5.1 parsing, a real OpenSSH installation,
+key-only localhost login, an elevated remote token, `powercfg`, idempotency,
+audit, rollback, and uninstall on Windows Server runners. The receipt verifies
+the effective SSH policy, service, listener, firewall, and host key. Actual LAN
+reachability is verified by the first authorized Mac connection.
 
 ## License
 
