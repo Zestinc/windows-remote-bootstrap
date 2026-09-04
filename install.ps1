@@ -107,7 +107,7 @@ function Write-ProtectedJsonFile {
     if (Test-Path -LiteralPath $temporaryPath) {
         if ((-not (Test-Path -LiteralPath $temporaryPath -PathType Leaf)) -or
             (Test-ReparsePoint -Path $temporaryPath) -or
-            (-not (Test-ManagedFileAcl -Path $temporaryPath))) {
+            (-not (Test-PathProtectedFromUntrustedMutation -Path $temporaryPath))) {
             throw "Protected JSON staging path is not owned by this installer: $temporaryPath"
         }
         Remove-Item -LiteralPath $temporaryPath -Force
@@ -140,7 +140,7 @@ function Remove-OrphanedProtectedJsonStaging {
         if (-not (Test-Path -LiteralPath $path)) { continue }
         if ((-not (Test-Path -LiteralPath $path -PathType Leaf)) -or
             (Test-ReparsePoint -Path $path) -or
-            (-not (Test-ManagedFileAcl -Path $path))) {
+            (-not (Test-PathProtectedFromUntrustedMutation -Path $path))) {
             throw "An orphaned protected JSON staging path changed identity: $path"
         }
         Remove-Item -LiteralPath $path -Force
@@ -1754,7 +1754,7 @@ function Restore-ConfigSnapshot {
     if (Test-Path -LiteralPath $temporaryPath) {
         if ((-not (Test-Path -LiteralPath $temporaryPath -PathType Leaf)) -or
             (Test-ReparsePoint -Path $temporaryPath) -or
-            (-not (Test-ManagedFileAcl -Path $temporaryPath)) -or
+            (-not (Test-PathProtectedFromUntrustedMutation -Path $temporaryPath)) -or
             ((Get-FileSha256 -Path $temporaryPath) -ne [string]$snapshot.sha256)) {
             throw 'The deterministic config restoration stage changed identity or content.'
         }

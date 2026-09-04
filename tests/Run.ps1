@@ -205,7 +205,8 @@ function Invoke-InstallerRaw {
 
 function Assert-Result {
     param($Result, [int]$ExitCode, [string]$Status, [string]$Context)
-    Assert-Equal $ExitCode $Result.ExitCode "$Context exit code"
+    $diagnostic = "$Context exit code; output=$($Result.Output -join ' | '); receipt=$($Result.Receipt | ConvertTo-Json -Depth 8 -Compress)"
+    Assert-Equal $ExitCode $Result.ExitCode $diagnostic
     Assert-True ($null -ne $Result.Receipt) "$Context did not produce a parseable receipt: $($Result.Output -join ' ')"
     Assert-Equal $Status ([string]$Result.Receipt.status) "$Context receipt status"
 }
