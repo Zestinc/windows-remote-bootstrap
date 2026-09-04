@@ -123,6 +123,7 @@ function Set-ExactAcl {
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][string[]]$AllowedSids,
         [Parameter(Mandatory = $true)][bool]$Directory,
+        [bool]$InheritToChildren = $true,
         [string]$OwnerSid = 'S-1-5-32-544'
     )
 
@@ -131,7 +132,7 @@ function Set-ExactAcl {
     foreach ($rule in @($acl.Access)) {
         [void]$acl.RemoveAccessRuleSpecific($rule)
     }
-    $inheritance = if ($Directory) {
+    $inheritance = if ($Directory -and $InheritToChildren) {
         [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
             [Security.AccessControl.InheritanceFlags]::ObjectInherit
     } else {
@@ -157,6 +158,7 @@ function Test-ExactAcl {
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][string[]]$AllowedSids,
         [Parameter(Mandatory = $true)][bool]$Directory,
+        [bool]$InheritToChildren = $true,
         [string[]]$AllowedOwnerSids = @('S-1-5-18', 'S-1-5-32-544')
     )
 
@@ -179,7 +181,7 @@ function Test-ExactAcl {
         return $false
     }
 
-    $expectedInheritance = if ($Directory) {
+    $expectedInheritance = if ($Directory -and $InheritToChildren) {
         [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
             [Security.AccessControl.InheritanceFlags]::ObjectInherit
     } else {
@@ -238,6 +240,68 @@ function Test-ManagedFileAcl {
 function Test-ManagedDirectoryAcl {
     param([Parameter(Mandatory = $true)][string]$Path)
     return Test-ExactAcl -Path $Path -AllowedSids @('S-1-5-18', 'S-1-5-32-544') -Directory $true
+}
+
+function Get-SshDirectorySnapshot {
+    if (-not (Test-Path -LiteralPath $script:SshPath)) {
+        return [ordered]@{ existed = $false; sddl = $null; attributes = $null }
+    }
+    if ((-not (Test-Path -LiteralPath $script:SshPath -PathType Container)) -or
+        (Test-ReparsePoint -Path $script:SshPath)) {
+        throw "OpenSSH data path must be a real directory: $script:SshPath"
+    }
+    $item = Get-Item -LiteralPath $script:SshPath -Force
+    return [ordered]@{
+        existed = $true
+        sddl = (Get-Acl -LiteralPath $script:SshPath).Sddl
+        attributes = [int]$item.Attributes
+    }
+}
+
+function Protect-SshDirectory {
+    if (-not (Test-Path -LiteralPath $script:SshPath)) {
+        [void](New-Item -Path $script:SshPath -ItemType Directory)
+    }
+    if ((-not (Test-Path -LiteralPath $script:SshPath -PathType Container)) -or
+        (Test-ReparsePoint -Path $script:SshPath)) {
+        throw "OpenSSH data path must be a real directory: $script:SshPath"
+    }
+    # Do not propagate a replacement ACL onto unrelated existing SSH files.
+    # The parent itself is protected so unprivileged users cannot replace its
+    # children; every file this installer relies on is protected separately.
+    Set-ExactAcl -Path $script:SshPath -AllowedSids @('S-1-5-18', 'S-1-5-32-544') `
+        -Directory $true -InheritToChildren $false
+    if (-not (Test-SshDirectoryAcl)) {
+        throw 'OpenSSH data directory ACL did not converge.'
+    }
+}
+
+function Test-SshDirectoryAcl {
+    return (Test-Path -LiteralPath $script:SshPath -PathType Container) -and
+        (-not (Test-ReparsePoint -Path $script:SshPath)) -and
+        (Test-ExactAcl -Path $script:SshPath -AllowedSids @('S-1-5-18', 'S-1-5-32-544') `
+            -Directory $true -InheritToChildren $false)
+}
+
+function Set-SecurityDescriptorFromSnapshot {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)]$Snapshot
+    )
+
+    if ((Test-ReparsePoint -Path $Path) -or (-not (Test-Path -LiteralPath $Path))) {
+        throw "Cannot restore security on a missing or reparse-point path: $Path"
+    }
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.SetSecurityDescriptorSddlForm([string]$Snapshot.sddl)
+    Set-Acl -LiteralPath $Path -AclObject $acl
+    [IO.File]::SetAttributes($Path, [IO.FileAttributes][int]$Snapshot.attributes)
+    $restoredAcl = Get-Acl -LiteralPath $Path
+    $restoredItem = Get-Item -LiteralPath $Path -Force
+    if (($restoredAcl.Sddl -ne [string]$Snapshot.sddl) -or
+        ([int]$restoredItem.Attributes -ne [int]$Snapshot.attributes)) {
+        throw "Security descriptor or attributes were not restored exactly: $Path"
+    }
 }
 
 function Get-SavedState {
@@ -456,10 +520,11 @@ function Ensure-TransactionAccount {
 
     $existing = Get-LocalUser -Name $Name -ErrorAction SilentlyContinue
     if ($null -ne $existing) {
-        $ownedBySid = -not [string]::IsNullOrWhiteSpace([string]$Transaction.accountSid) -and
-            ([string]$existing.SID.Value -eq [string]$Transaction.accountSid)
+        $hasRecordedSid = -not [string]::IsNullOrWhiteSpace([string]$Transaction.accountSid)
+        $ownedBySid = $hasRecordedSid -and ([string]$existing.SID.Value -eq [string]$Transaction.accountSid)
         $ownedByMarker = ([string]$existing.Description -eq [string]$Transaction.accountMarker)
-        if (-not ($ownedBySid -or $ownedByMarker)) {
+        if (($hasRecordedSid -and (-not ($ownedBySid -and $ownedByMarker))) -or
+            ((-not $hasRecordedSid) -and (-not $ownedByMarker))) {
             throw "Local account '$Name' exists but is not owned by the active install transaction."
         }
     } else {
@@ -501,6 +566,7 @@ Port $SshPort
 AddressFamily any
 ListenAddress 0.0.0.0
 ListenAddress ::
+HostKey __PROGRAMDATA__/ssh/ssh_host_ed25519_key
 PubkeyAuthentication yes
 PasswordAuthentication no
 AuthenticationMethods publickey
@@ -535,6 +601,7 @@ function Test-EffectiveSshPolicy {
         'addressfamily any',
         "listenaddress 0.0.0.0:$SshPort",
         "listenaddress [::]:$SshPort",
+        'hostkey __programdata__/ssh/ssh_host_ed25519_key',
         'pubkeyauthentication yes',
         'passwordauthentication no',
         'authenticationmethods publickey',
@@ -554,6 +621,7 @@ function Test-EffectiveSshPolicy {
         }
     }
     return (@($lines | Where-Object { $_ -like 'port *' }).Count -eq 1) -and
+        (@($lines | Where-Object { $_ -like 'hostkey *' }).Count -eq 1) -and
         (@($lines | Where-Object { $_ -like 'allowusers *' }).Count -eq 1) -and
         (@($lines | Where-Object { $_ -like 'authorizedkeysfile *' }).Count -eq 1)
 }
@@ -574,18 +642,28 @@ function Get-SshKeygenExecutable {
     return $candidate
 }
 
+function Protect-OpenSshHostKeys {
+    $privateHostKeys = @(Get-ChildItem -LiteralPath $script:SshPath -Filter 'ssh_host_*_key' -File -ErrorAction SilentlyContinue)
+    if ($privateHostKeys.Count -eq 0) {
+        throw 'OpenSSH did not generate any private host keys.'
+    }
+    foreach ($hostKey in $privateHostKeys) {
+        if (Test-ReparsePoint -Path $hostKey.FullName) {
+            throw "OpenSSH private host key is a reparse point: $($hostKey.FullName)"
+        }
+        Protect-ManagedFile -Path $hostKey.FullName
+    }
+}
+
 function Assert-OpenSshHostKeysProtected {
     $privateHostKeys = @(Get-ChildItem -LiteralPath $script:SshPath -Filter 'ssh_host_*_key' -File -ErrorAction SilentlyContinue)
     if ($privateHostKeys.Count -eq 0) {
         throw 'OpenSSH did not generate any private host keys.'
     }
     foreach ($hostKey in $privateHostKeys) {
-        # The Windows sshd service creates its private host keys with a
-        # protected SYSTEM/Administrators ACL. Do not rewrite those
-        # service-owned files; fail closed if their ACL is unexpectedly broad.
-        if (-not (Test-ManagedFileAcl -Path $hostKey.FullName)) {
-            $acl = Get-Acl -LiteralPath $hostKey.FullName
-            throw "OpenSSH private host key has an unexpected ACL: $($hostKey.FullName); owner=$($acl.Owner); protected=$($acl.AreAccessRulesProtected); sddl=$($acl.Sddl)"
+        if ((Test-ReparsePoint -Path $hostKey.FullName) -or
+            (-not (Test-ManagedFileAcl -Path $hostKey.FullName))) {
+            throw "OpenSSH private host key has an unexpected ACL or type: $($hostKey.FullName)"
         }
     }
 }
@@ -638,9 +716,9 @@ function Get-HostKeyFingerprint {
 }
 
 function Disable-DefaultOpenSshFirewallRule {
-    $rule = Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue
+    $rule = Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -PolicyStore PersistentStore -ErrorAction SilentlyContinue
     if ($null -ne $rule) {
-        Disable-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' | Out-Null
+        $rule | Disable-NetFirewallRule | Out-Null
     }
 }
 
@@ -669,9 +747,15 @@ function Get-CompetingSshFirewallRules {
 
     $targetProgram = [IO.Path]::GetFullPath($SshdExe).TrimEnd('\').ToLowerInvariant()
     $competing = New-Object System.Collections.ArrayList
-    $rules = @(Get-NetFirewallRule -Enabled True -Direction Inbound -Action Allow -ErrorAction SilentlyContinue |
+    $rules = @(Get-NetFirewallRule -PolicyStore ActiveStore -Enabled True -Direction Inbound -Action Allow -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -notin @($script:FirewallRuleName, 'OpenSSH-Server-In-TCP') })
     foreach ($rule in $rules) {
+        $enforcement = @($rule.EnforcementStatus | ForEach-Object { [string]$_ })
+        # ActiveStore can retain packaged-app capability rules whose hidden app
+        # identity currently cannot resolve. Such a rule cannot match sshd.exe.
+        if (($enforcement -contains 'ApplicationResolutionEmpty') -or ($enforcement -contains '11')) {
+            continue
+        }
         $portFilter = $rule | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue
         if ($null -eq $portFilter) {
             continue
@@ -697,7 +781,7 @@ function Get-CompetingSshFirewallRules {
         $serviceName = if ($null -eq $serviceFilter) { 'Any' } else { [string]$serviceFilter.Service }
         $serviceApplies = ($serviceName -eq 'Any') -or ($serviceName -eq 'sshd')
         if ($programApplies -and $packageApplies -and $serviceApplies) {
-            [void]$competing.Add("$([string]$rule.Name) [owner=$([string]$rule.Owner); package=$package; program=$program; service=$serviceName]")
+            [void]$competing.Add("$([string]$rule.Name) [owner=$([string]$rule.Owner); package=$package; program=$program; service=$serviceName; enforcement=$($enforcement -join ','); source=$([string]$rule.PolicyStoreSourceType)]")
         }
     }
     return @($competing)
@@ -709,7 +793,7 @@ function Assert-FirewallPreconditions {
         [Parameter(Mandatory = $true)][string]$SshdExe
     )
 
-    $disabledProfiles = @(Get-NetFirewallProfile -ErrorAction Stop | Where-Object { [string]$_.Enabled -ne 'True' })
+    $disabledProfiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop | Where-Object { [string]$_.Enabled -ne 'True' })
     if ($disabledProfiles.Count -gt 0) {
         throw "Windows Firewall must be enabled for every profile; disabled: $((@($disabledProfiles.Name)) -join ', ')."
     }
@@ -723,10 +807,11 @@ function Test-ManagedFirewallRule {
     param(
         [Parameter(Mandatory = $true)][int]$SshPort,
         [Parameter(Mandatory = $true)][string[]]$RemoteAddress,
-        [Parameter(Mandatory = $true)][string]$SshdExe
+        [Parameter(Mandatory = $true)][string]$SshdExe,
+        [ValidateSet('ActiveStore', 'PersistentStore')][string]$PolicyStore = 'ActiveStore'
     )
 
-    $rules = @(Get-NetFirewallRule -Name $script:FirewallRuleName -ErrorAction SilentlyContinue)
+    $rules = @(Get-NetFirewallRule -Name $script:FirewallRuleName -PolicyStore $PolicyStore -ErrorAction SilentlyContinue)
     if ($rules.Count -ne 1) { return $false }
     $rule = $rules[0]
     if (([string]$rule.Enabled -ne 'True') -or
@@ -764,7 +849,7 @@ function New-ManagedFirewallRule {
         [Parameter(Mandatory = $true)][string]$SshdExe
     )
 
-    if ($null -ne (Get-NetFirewallRule -Name $script:FirewallRuleName -ErrorAction SilentlyContinue)) {
+    if ($null -ne (Get-NetFirewallRule -Name $script:FirewallRuleName -PolicyStore PersistentStore -ErrorAction SilentlyContinue)) {
         throw "Firewall rule '$script:FirewallRuleName' already exists without finalized ownership state."
     }
     New-NetFirewallRule -Name $script:FirewallRuleName `
@@ -773,9 +858,15 @@ function New-ManagedFirewallRule {
         -Enabled True -Profile Any -Direction Inbound -Action Allow `
         -Protocol TCP -LocalPort $SshPort -RemoteAddress $RemoteAddress `
         -Program $SshdExe | Out-Null
-    if (-not (Test-ManagedFirewallRule -SshPort $SshPort -RemoteAddress $RemoteAddress -SshdExe $SshdExe)) {
+    if ((-not (Test-ManagedFirewallRule -SshPort $SshPort -RemoteAddress $RemoteAddress -SshdExe $SshdExe -PolicyStore PersistentStore)) -or
+        (-not (Test-ManagedFirewallRule -SshPort $SshPort -RemoteAddress $RemoteAddress -SshdExe $SshdExe -PolicyStore ActiveStore))) {
         throw 'The managed firewall rule failed exact filter verification.'
     }
+}
+
+function Test-DefaultOpenSshFirewallClosed {
+    $rules = @(Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -PolicyStore ActiveStore -ErrorAction SilentlyContinue)
+    return @($rules | Where-Object { [string]$_.Enabled -eq 'True' }).Count -eq 0
 }
 
 function Invoke-TestHook {
@@ -792,22 +883,55 @@ function Invoke-TestHook {
 
 function Get-HostKeyFileRecords {
     if (-not (Test-Path -LiteralPath $script:SshPath -PathType Container)) { return @() }
+    if (Test-ReparsePoint -Path $script:SshPath) {
+        throw 'OpenSSH host-key directory is a reparse point.'
+    }
     return @(Get-ChildItem -LiteralPath $script:SshPath -Filter 'ssh_host_*' -File -ErrorAction SilentlyContinue |
         Sort-Object Name |
         ForEach-Object {
-            [ordered]@{ name = $_.Name; sha256 = (Get-FileSha256 -Path $_.FullName) }
+            if (([IO.Path]::GetFileName($_.Name) -ne $_.Name) -or
+                ($_.Name -notmatch '^ssh_host_[A-Za-z0-9._-]+$') -or
+                (Test-ReparsePoint -Path $_.FullName)) {
+                throw "Unsafe OpenSSH host-key path: $($_.FullName)"
+            }
+            [ordered]@{
+                name = $_.Name
+                sha256 = (Get-FileSha256 -Path $_.FullName)
+                sddl = (Get-Acl -LiteralPath $_.FullName).Sddl
+                attributes = [int]$_.Attributes
+            }
         })
 }
 
 function Get-ServiceSnapshot {
     $service = Get-Service -Name sshd -ErrorAction SilentlyContinue
     if ($null -eq $service) {
-        return [ordered]@{ existed = $false; status = $null; startType = $null }
+        return [ordered]@{ existed = $false; status = $null; startType = $null; startName = $null; pathName = $null }
     }
+    $cim = Get-CimInstance -ClassName Win32_Service -Filter "Name='sshd'" -ErrorAction Stop
     return [ordered]@{
         existed = $true
         status = [string]$service.Status
         startType = [string]$service.StartType
+        startName = [string]$cim.StartName
+        pathName = [string]$cim.PathName
+    }
+}
+
+function Test-SshdServiceIdentity {
+    $service = Get-CimInstance -ClassName Win32_Service -Filter "Name='sshd'" -ErrorAction SilentlyContinue
+    if ($null -eq $service) { return $false }
+    if ([string]$service.StartName -notin @('LocalSystem', 'NT AUTHORITY\SYSTEM')) { return $false }
+    $rawPath = [Environment]::ExpandEnvironmentVariables([string]$service.PathName).Trim()
+    if ($rawPath.StartsWith('"') -and $rawPath.EndsWith('"')) {
+        $rawPath = $rawPath.Substring(1, $rawPath.Length - 2)
+    }
+    try {
+        $actual = [IO.Path]::GetFullPath($rawPath).TrimEnd('\')
+        $expected = [IO.Path]::GetFullPath((Join-Path $env:SystemRoot 'System32\OpenSSH\sshd.exe')).TrimEnd('\')
+        return $actual -ieq $expected
+    } catch {
+        return $false
     }
 }
 
@@ -880,11 +1004,13 @@ function Restore-ConfigSnapshot {
     $temporaryPath = Join-Path $script:SshPath ("sshd_config.restore.$([Guid]::NewGuid().ToString('N'))")
     try {
         [IO.File]::WriteAllBytes($temporaryPath, [Convert]::FromBase64String([string]$Snapshot.bytesBase64))
-        $acl = Get-Acl -LiteralPath $temporaryPath
-        $acl.SetSecurityDescriptorSddlForm([string]$Snapshot.sddl)
-        Set-Acl -LiteralPath $temporaryPath -AclObject $acl
-        [IO.File]::SetAttributes($temporaryPath, [IO.FileAttributes][int]$Snapshot.attributes)
+        Protect-ManagedFile -Path $temporaryPath
+        if ((Test-Path -LiteralPath $script:SshConfigPath) -and
+            (Test-ReparsePoint -Path $script:SshConfigPath)) {
+            throw 'Refusing to replace a reparse-point sshd_config during recovery.'
+        }
         Move-Item -LiteralPath $temporaryPath -Destination $script:SshConfigPath -Force
+        Set-SecurityDescriptorFromSnapshot -Path $script:SshConfigPath -Snapshot $Snapshot
         if ((Get-FileSha256 -Path $script:SshConfigPath) -ne [string]$Snapshot.sha256) {
             throw 'Original sshd_config byte restoration failed hash verification.'
         }
@@ -893,21 +1019,113 @@ function Restore-ConfigSnapshot {
     }
 }
 
+function Restore-SshDirectorySnapshot {
+    param(
+        [Parameter(Mandatory = $true)]$Snapshot,
+        [bool]$RemoveIfOriginallyAbsent = $false
+    )
+
+    if ([bool]$Snapshot.existed) {
+        if (-not (Test-Path -LiteralPath $script:SshPath -PathType Container)) {
+            throw 'Cannot restore the original OpenSSH directory because it is missing.'
+        }
+        Set-SecurityDescriptorFromSnapshot -Path $script:SshPath -Snapshot $Snapshot
+    } elseif ($RemoveIfOriginallyAbsent -and (Test-Path -LiteralPath $script:SshPath)) {
+        if ((Test-ReparsePoint -Path $script:SshPath) -or
+            (-not (Test-Path -LiteralPath $script:SshPath -PathType Container))) {
+            throw 'Refusing to remove an unexpected OpenSSH data path.'
+        }
+        if (@(Get-ChildItem -LiteralPath $script:SshPath -Force).Count -ne 0) {
+            throw 'The newly created OpenSSH data directory contains unowned files; refusing to remove it.'
+        }
+        Remove-Item -LiteralPath $script:SshPath -Force
+    }
+}
+
 function Restore-DefaultFirewallSnapshot {
     param([Parameter(Mandatory = $true)]$Snapshot)
 
-    $rules = @(Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)
+    $rules = @(Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -PolicyStore PersistentStore -ErrorAction SilentlyContinue)
     if ([bool]$Snapshot.existed) {
         if ($rules.Count -ne 1) {
             throw 'Cannot restore the original OpenSSH firewall rule because its identity changed.'
         }
         if ([bool]$Snapshot.enabled) {
-            Enable-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' | Out-Null
+            $rules[0] | Enable-NetFirewallRule | Out-Null
         } else {
-            Disable-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' | Out-Null
+            $rules[0] | Disable-NetFirewallRule | Out-Null
         }
     } elseif ($rules.Count -gt 0) {
         $rules | Remove-NetFirewallRule
+    }
+}
+
+function Assert-ValidSecurityDescriptor {
+    param([Parameter(Mandatory = $true)][string]$Sddl)
+    if ([string]::IsNullOrWhiteSpace($Sddl)) { throw 'A required security descriptor is missing.' }
+    try {
+        [void](New-Object -TypeName Security.AccessControl.RawSecurityDescriptor -ArgumentList (,$Sddl))
+    } catch {
+        throw 'A recorded security descriptor is invalid.'
+    }
+}
+
+function Assert-HostKeyRecordsShape {
+    param([Parameter(Mandatory = $true)]$Records)
+
+    $seen = @{}
+    foreach ($record in @($Records)) {
+        $name = [string]$record.name
+        if (([IO.Path]::GetFileName($name) -ne $name) -or
+            ($name -notmatch '^ssh_host_[A-Za-z0-9._-]+$')) {
+            throw "Unsafe recorded host-key filename: '$name'."
+        }
+        if ($seen.ContainsKey($name.ToLowerInvariant())) { throw "Duplicate recorded host-key filename: '$name'." }
+        $seen[$name.ToLowerInvariant()] = $true
+        if ([string]$record.sha256 -notmatch '^[0-9a-f]{64}$') { throw "Invalid host-key hash: '$name'." }
+        Assert-ValidSecurityDescriptor -Sddl ([string]$record.sddl)
+        try { [void][int]$record.attributes } catch { throw "Invalid host-key attributes: '$name'." }
+    }
+}
+
+function Assert-SnapshotShape {
+    param([Parameter(Mandatory = $true)]$Original)
+
+    foreach ($value in @($Original.capabilityInstalled, $Original.sshDirectory.existed,
+            $Original.config.existed, $Original.service.existed, $Original.defaultFirewall.existed,
+            $Original.defaultFirewall.enabled)) {
+        if ($value -isnot [bool]) { throw 'A recorded baseline boolean is invalid.' }
+    }
+    if ([bool]$Original.sshDirectory.existed) {
+        Assert-ValidSecurityDescriptor -Sddl ([string]$Original.sshDirectory.sddl)
+        try { [void][int]$Original.sshDirectory.attributes } catch { throw 'Invalid OpenSSH directory attributes.' }
+    }
+    if ([bool]$Original.config.existed) {
+        $bytes = [Convert]::FromBase64String([string]$Original.config.bytesBase64)
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try {
+            $embeddedHash = (($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join '')
+        } finally {
+            $sha.Dispose()
+        }
+        if (($embeddedHash -ne [string]$Original.config.sha256) -or
+            ([string]$Original.config.sha256 -notmatch '^[0-9a-f]{64}$')) {
+            throw 'Original config bytes do not match their recorded hash.'
+        }
+        Assert-ValidSecurityDescriptor -Sddl ([string]$Original.config.sddl)
+        try { [void][int]$Original.config.attributes } catch { throw 'Invalid original config attributes.' }
+    }
+    Assert-HostKeyRecordsShape -Records @($Original.hostKeyFiles)
+    if ([string]$Original.service.status -notin @('', 'Running', 'Stopped', 'Paused', 'StartPending', 'StopPending', 'ContinuePending', 'PausePending')) {
+        throw 'Invalid original sshd service status.'
+    }
+    if ([string]$Original.service.startType -notin @('', 'Automatic', 'Manual', 'Disabled')) {
+        throw 'Invalid original sshd service startup type.'
+    }
+    if ([bool]$Original.service.existed -and
+        ([string]::IsNullOrWhiteSpace([string]$Original.service.startName) -or
+            [string]::IsNullOrWhiteSpace([string]$Original.service.pathName))) {
+        throw 'Original sshd service identity is incomplete.'
     }
 }
 
@@ -920,16 +1138,17 @@ function Assert-TransactionShape {
     Assert-AllowedRemoteAddress -Values @($Transaction.allowedRemoteAddress)
     if (([int]$Transaction.port -lt 1) -or ([int]$Transaction.port -gt 65535)) { throw 'Invalid transaction SSH port.' }
     if ([string]$Transaction.authorizedKeysCanonicalSha256 -notmatch '^[0-9a-f]{64}$') { throw 'Invalid transaction key hash.' }
+    if ([string]$Transaction.phase -notin @('created', 'capability', 'ssh-directory', 'account', 'host-keys', 'config', 'firewall', 'service', 'state-commit')) {
+        throw 'Invalid install transaction phase.'
+    }
     if ($null -ne $Transaction.accountSid -and
         -not [string]::IsNullOrWhiteSpace([string]$Transaction.accountSid) -and
         [string]$Transaction.accountSid -notmatch '^S-1-5-21-') {
         throw 'Invalid transaction account SID.'
     }
-    if ([bool]$Transaction.original.config.existed) {
-        [void][Convert]::FromBase64String([string]$Transaction.original.config.bytesBase64)
-        if ([string]$Transaction.original.config.sha256 -notmatch '^[0-9a-f]{64}$') { throw 'Invalid original config hash.' }
-        if ([string]::IsNullOrWhiteSpace([string]$Transaction.original.config.sddl)) { throw 'Missing original config security descriptor.' }
-    }
+    Assert-SnapshotShape -Original $Transaction.original
+    Assert-HostKeyRecordsShape -Records @($Transaction.generatedHostKeyFiles)
+    Assert-HostKeyRecordsShape -Records @(@($Transaction.original.hostKeyFiles) + @($Transaction.generatedHostKeyFiles))
 }
 
 function Assert-StateShape {
@@ -945,11 +1164,10 @@ function Assert-StateShape {
     }
     if ([string]$State.accountSid -notmatch '^S-1-5-21-') { throw 'Invalid managed account SID.' }
     if ([string]$State.firewallRuleName -ne $script:FirewallRuleName) { throw 'Invalid managed firewall rule identity.' }
-    if ([bool]$State.original.config.existed) {
-        [void][Convert]::FromBase64String([string]$State.original.config.bytesBase64)
-        if ([string]$State.original.config.sha256 -notmatch '^[0-9a-f]{64}$') { throw 'Invalid original config hash.' }
-        if ([string]::IsNullOrWhiteSpace([string]$State.original.config.sddl)) { throw 'Missing original config security descriptor.' }
-    }
+    if ($State.uninstallRemoveCapability -isnot [bool]) { throw 'Invalid uninstall capability choice in managed state.' }
+    Assert-SnapshotShape -Original $State.original
+    Assert-HostKeyRecordsShape -Records @($State.generatedHostKeyFiles)
+    Assert-HostKeyRecordsShape -Records @(@($State.original.hostKeyFiles) + @($State.generatedHostKeyFiles))
 }
 
 function New-InstallTransaction {
@@ -968,19 +1186,29 @@ function New-InstallTransaction {
     if ($null -ne (Get-LocalUser -Name $Name -ErrorAction SilentlyContinue)) {
         throw "Local account '$Name' already exists without trusted state."
     }
-    if ($null -ne (Get-NetFirewallRule -Name $script:FirewallRuleName -ErrorAction SilentlyContinue)) {
+    if ($null -ne (Get-NetFirewallRule -Name $script:FirewallRuleName -PolicyStore PersistentStore -ErrorAction SilentlyContinue)) {
         throw "Firewall rule '$script:FirewallRuleName' already exists without trusted state."
     }
+    if ($null -ne (Get-NetFirewallRule -Name $script:FirewallRuleName -PolicyStore ActiveStore -ErrorAction SilentlyContinue)) {
+        throw "An effective firewall policy already uses reserved rule name '$script:FirewallRuleName'."
+    }
 
+    $sshDirectorySnapshot = Get-SshDirectorySnapshot
     $capability = Get-WindowsCapability -Online -Name $script:CapabilityName
     $serviceSnapshot = Get-ServiceSnapshot
     $configSnapshot = Get-ConfigSnapshot
+    $hostKeySnapshot = @(Get-HostKeyFileRecords)
+    if (($capability.State -ne 'Installed') -and
+        ([bool]$serviceSnapshot.existed -or [bool]$configSnapshot.existed -or
+            [bool]$sshDirectorySnapshot.existed -or $hostKeySnapshot.Count -gt 0)) {
+        throw 'OpenSSH files or service exist while the Windows capability is absent; refusing an ambiguous takeover.'
+    }
     $hasExistingSshd = ($capability.State -eq 'Installed') -or [bool]$serviceSnapshot.existed -or [bool]$configSnapshot.existed
     if ($hasExistingSshd -and (-not $MayTakeOver)) {
         throw 'OpenSSH Server already exists. Rerun with -TakeOverExistingSshd only if replacing its entire access policy is intended.'
     }
 
-    $defaultRules = @(Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)
+    $defaultRules = @(Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -PolicyStore PersistentStore -ErrorAction SilentlyContinue)
     if ($defaultRules.Count -gt 1) { throw 'More than one default OpenSSH firewall rule exists; refusing ambiguous takeover.' }
     $defaultFirewall = [ordered]@{
         existed = ($defaultRules.Count -eq 1)
@@ -994,6 +1222,7 @@ function New-InstallTransaction {
         schemaVersion = 2
         installerVersion = $script:InstallerVersion
         status = 'installing'
+        phase = 'created'
         transactionId = $transactionId
         createdAt = (Get-Date).ToUniversalTime().ToString('o')
         accountName = $Name
@@ -1009,9 +1238,10 @@ function New-InstallTransaction {
         original = [ordered]@{
             capabilityInstalled = ($capability.State -eq 'Installed')
             service = $serviceSnapshot
+            sshDirectory = $sshDirectorySnapshot
             config = $configSnapshot
             defaultFirewall = $defaultFirewall
-            hostKeyFiles = @(Get-HostKeyFileRecords)
+            hostKeyFiles = $hostKeySnapshot
         }
     }
 
@@ -1060,6 +1290,38 @@ function Assert-RequestedInstallMatches {
     }
 }
 
+function Assert-OriginalHostKeysUnchanged {
+    param([Parameter(Mandatory = $true)]$Records)
+
+    foreach ($record in @($Records)) {
+        $path = Join-Path $script:SshPath ([string]$record.name)
+        if ((-not (Test-Path -LiteralPath $path -PathType Leaf)) -or
+            (Test-ReparsePoint -Path $path) -or
+            ((Get-FileSha256 -Path $path) -ne [string]$record.sha256)) {
+            throw "An original OpenSSH host-key file changed during the transaction: $path"
+        }
+    }
+}
+
+function Get-GeneratedHostKeyRecords {
+    param([Parameter(Mandatory = $true)]$OriginalRecords)
+
+    $originalNames = @($OriginalRecords | ForEach-Object { ([string]$_.name).ToLowerInvariant() })
+    return @(Get-HostKeyFileRecords | Where-Object {
+        $originalNames -notcontains ([string]$_.name).ToLowerInvariant()
+    })
+}
+
+function Restore-OriginalHostKeySecurity {
+    param([Parameter(Mandatory = $true)]$Records)
+
+    Assert-OriginalHostKeysUnchanged -Records $Records
+    foreach ($record in @($Records)) {
+        $path = Join-Path $script:SshPath ([string]$record.name)
+        Set-SecurityDescriptorFromSnapshot -Path $path -Snapshot $record
+    }
+}
+
 function Remove-GeneratedHostKeys {
     param([Parameter(Mandatory = $true)]$Records)
 
@@ -1079,10 +1341,8 @@ function Undo-InstallTransaction {
 
     Assert-TransactionShape -Transaction $Transaction
     Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
-    Get-NetFirewallRule -Name $script:FirewallRuleName -ErrorAction SilentlyContinue |
+    Get-NetFirewallRule -Name $script:FirewallRuleName -PolicyStore PersistentStore -ErrorAction SilentlyContinue |
         Remove-NetFirewallRule -ErrorAction Stop
-    Restore-ConfigSnapshot -Snapshot $Transaction.original.config
-    Restore-DefaultFirewallSnapshot -Snapshot $Transaction.original.defaultFirewall
 
     $account = Get-LocalUser -Name ([string]$Transaction.accountName) -ErrorAction SilentlyContinue
     if ($null -ne $account) {
@@ -1102,20 +1362,51 @@ function Undo-InstallTransaction {
         }
     }
 
-    Remove-GeneratedHostKeys -Records @($Transaction.generatedHostKeyFiles)
+    $restartRequired = $false
     if (-not [bool]$Transaction.original.capabilityInstalled) {
         $capability = Get-WindowsCapability -Online -Name $script:CapabilityName
         if ($capability.State -eq 'Installed') {
             $removeResult = Remove-WindowsCapability -Online -Name $script:CapabilityName
             if ($removeResult.RestartNeeded) {
-                $Transaction.status = 'rollback-restart-required'
-                Update-InstallTransaction -Transaction $Transaction
-                throw 'Rollback requires a Windows restart. Restart, then run the same installer command again.'
+                $restartRequired = $true
             }
         }
     }
+
+    $generatedNow = @()
+    if (Test-Path -LiteralPath $script:SshPath -PathType Container) {
+        $generatedNow = @(Get-GeneratedHostKeyRecords -OriginalRecords @($Transaction.original.hostKeyFiles))
+        $recordedByName = @{}
+        foreach ($record in @($Transaction.generatedHostKeyFiles)) {
+            $recordedByName[([string]$record.name).ToLowerInvariant()] = $record
+        }
+        foreach ($record in $generatedNow) {
+            $key = ([string]$record.name).ToLowerInvariant()
+            if ($recordedByName.ContainsKey($key) -and
+                ([string]$recordedByName[$key].sha256 -ne [string]$record.sha256)) {
+                throw "A generated host-key file changed before recovery: $($record.name)"
+            }
+        }
+        Remove-GeneratedHostKeys -Records $generatedNow
+    }
+
+    Restore-ConfigSnapshot -Snapshot $Transaction.original.config
+    Restore-DefaultFirewallSnapshot -Snapshot $Transaction.original.defaultFirewall
+    Restore-SshDirectorySnapshot -Snapshot $Transaction.original.sshDirectory `
+        -RemoveIfOriginallyAbsent ((-not [bool]$Transaction.original.capabilityInstalled) -and (-not $restartRequired))
+    if ([bool]$Transaction.original.sshDirectory.existed) {
+        if ([bool]$Transaction.original.config.existed) {
+            Set-SecurityDescriptorFromSnapshot -Path $script:SshConfigPath -Snapshot $Transaction.original.config
+        }
+        Restore-OriginalHostKeySecurity -Records @($Transaction.original.hostKeyFiles)
+    }
     Restore-ServiceSnapshot -Snapshot $Transaction.original.service
     Remove-Item -LiteralPath $script:KeyPath -Force -ErrorAction SilentlyContinue
+    if ($restartRequired) {
+        $Transaction.status = 'rollback-restart-required'
+        Update-InstallTransaction -Transaction $Transaction
+        throw 'Rollback restored managed configuration but Windows capability removal requires a restart. Restart, then run the same installer command again.'
+    }
     Remove-Item -LiteralPath $script:TransactionPath -Force
     if ((Test-Path -LiteralPath $script:RootPath) -and
         @(Get-ChildItem -LiteralPath $script:RootPath -Force).Count -eq 0) {
@@ -1220,6 +1511,8 @@ function Install-WindowsRemoteBootstrap {
     }
 
     try {
+        $transaction.phase = 'capability'
+        Update-InstallTransaction -Transaction $transaction
         $capability = Get-WindowsCapability -Online -Name $script:CapabilityName
         if ($capability.State -ne 'Installed') {
             $capabilityResult = Add-WindowsCapability -Online -Name $script:CapabilityName
@@ -1241,10 +1534,28 @@ function Install-WindowsRemoteBootstrap {
         Assert-FirewallPreconditions -SshPort $SshPort -SshdExe $sshdExe
         $service = Get-Service -Name sshd -ErrorAction SilentlyContinue
         if ($null -eq $service) { throw 'OpenSSH capability is installed, but the sshd service is missing.' }
+        if (-not (Test-SshdServiceIdentity)) {
+            throw 'The sshd service must run the in-box System32 OpenSSH binary as LocalSystem.'
+        }
         Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
         Disable-DefaultOpenSshFirewallRule
+        if (-not (Test-DefaultOpenSshFirewallClosed)) {
+            throw 'The effective default OpenSSH firewall rule remains enabled (possibly by Group Policy).'
+        }
 
+        $transaction.phase = 'ssh-directory'
+        Update-InstallTransaction -Transaction $transaction
+        Protect-SshDirectory
+        if ([bool]$transaction.original.config.existed -and
+            ((Get-FileSha256 -Path $script:SshConfigPath) -ne [string]$transaction.original.config.sha256)) {
+            throw 'The original sshd_config changed before the protected takeover boundary was established.'
+        }
+        Assert-OriginalHostKeysUnchanged -Records @($transaction.original.hostKeyFiles)
+
+        $transaction.phase = 'account'
+        Update-InstallTransaction -Transaction $transaction
         $account = Ensure-TransactionAccount -Name $Name -Transaction $transaction
+        Invoke-TestHook -Stage 'account-before-sid-journal'
         $transaction.accountSid = [string]$account.SID.Value
         Update-InstallTransaction -Transaction $transaction
         Invoke-TestHook -Stage 'account'
@@ -1260,17 +1571,19 @@ function Install-WindowsRemoteBootstrap {
         if (-not (Test-ManagedFileAcl -Path $script:KeyPath)) { throw 'Authorized key ACL verification failed.' }
         $fingerprints = @(Get-KeyFingerprints -Path $script:KeyPath)
 
-        if (-not (Test-Path -LiteralPath $script:SshPath -PathType Container)) {
-            [void](New-Item -Path $script:SshPath -ItemType Directory -Force)
-        }
+        $transaction.phase = 'host-keys'
+        Update-InstallTransaction -Transaction $transaction
         $keygen = Get-SshKeygenExecutable
         $keygenOutput = @(& $keygen -A 2>&1)
         if ($LASTEXITCODE -ne 0) { throw "OpenSSH host key generation failed: $($keygenOutput -join ' ')" }
-        $originalNames = @($transaction.original.hostKeyFiles | ForEach-Object { [string]$_.name })
-        $transaction.generatedHostKeyFiles = @(Get-HostKeyFileRecords | Where-Object { $originalNames -notcontains [string]$_.name })
+        Invoke-TestHook -Stage 'hostkeys-before-journal'
+        Protect-OpenSshHostKeys
+        $transaction.generatedHostKeyFiles = @(Get-GeneratedHostKeyRecords -OriginalRecords @($transaction.original.hostKeyFiles))
         Update-InstallTransaction -Transaction $transaction
         Assert-OpenSshHostKeysProtected
 
+        $transaction.phase = 'config'
+        Update-InstallTransaction -Transaction $transaction
         $managedConfig = New-ManagedSshConfig -Name $Name -SshPort $SshPort
         $candidatePath = Join-Path $script:SshPath ("sshd_config.$([Guid]::NewGuid().ToString('N')).candidate")
         try {
@@ -1287,9 +1600,12 @@ function Install-WindowsRemoteBootstrap {
         if (-not (Test-ManagedFileAcl -Path $script:SshConfigPath)) { throw 'Active sshd_config ACL verification failed.' }
         Invoke-TestHook -Stage 'config'
 
-        $existingOwnRule = Get-NetFirewallRule -Name $script:FirewallRuleName -ErrorAction SilentlyContinue
+        $transaction.phase = 'firewall'
+        Update-InstallTransaction -Transaction $transaction
+        $existingOwnRule = Get-NetFirewallRule -Name $script:FirewallRuleName -PolicyStore PersistentStore -ErrorAction SilentlyContinue
         if ($null -ne $existingOwnRule) {
-            if (-not (Test-ManagedFirewallRule -SshPort $SshPort -RemoteAddress $RemoteAddress -SshdExe $sshdExe)) {
+            if ((-not (Test-ManagedFirewallRule -SshPort $SshPort -RemoteAddress $RemoteAddress -SshdExe $sshdExe -PolicyStore PersistentStore)) -or
+                (-not (Test-ManagedFirewallRule -SshPort $SshPort -RemoteAddress $RemoteAddress -SshdExe $sshdExe -PolicyStore ActiveStore))) {
                 $existingOwnRule | Remove-NetFirewallRule
                 New-ManagedFirewallRule -SshPort $SshPort -RemoteAddress $RemoteAddress -SshdExe $sshdExe
             }
@@ -1298,6 +1614,8 @@ function Install-WindowsRemoteBootstrap {
         }
         Invoke-TestHook -Stage 'firewall'
 
+        $transaction.phase = 'service'
+        Update-InstallTransaction -Transaction $transaction
         Set-Service -Name sshd -StartupType Automatic
         Start-Service -Name sshd
         $deadline = (Get-Date).AddSeconds(15)
@@ -1310,6 +1628,8 @@ function Install-WindowsRemoteBootstrap {
         }
         Invoke-TestHook -Stage 'service'
 
+        $transaction.phase = 'state-commit'
+        Update-InstallTransaction -Transaction $transaction
         $state = [ordered]@{
             schemaVersion = 2
             installerVersion = $script:InstallerVersion
@@ -1330,6 +1650,7 @@ function Install-WindowsRemoteBootstrap {
             hostKeyFingerprint = Get-HostKeyFingerprint
             openSshInstalledByTool = [bool]$transaction.capabilityInstalledByTool
             existingSshdTakenOver = [bool]$transaction.takeOverExistingSshd
+            uninstallRemoveCapability = $false
             generatedHostKeyFiles = @($transaction.generatedHostKeyFiles)
             original = $transaction.original
         }
@@ -1424,6 +1745,7 @@ function Invoke-WindowsRemoteBootstrapAudit {
     }
     Add-AuditCheck 'authorized-keys' $keyOk (($fingerprints -join '; '))
     Add-AuditCheck 'authorized-keys-acl' (Test-ManagedFileAcl -Path $script:KeyPath) 'SYSTEM and Administrators only'
+    Add-AuditCheck 'openssh-directory-acl' (Test-SshDirectoryAcl) 'real directory; SYSTEM/Administrators exact FullControl'
 
     $hostKeysOk = $true
     try {
@@ -1432,15 +1754,25 @@ function Invoke-WindowsRemoteBootstrapAudit {
         $hostKeysOk = $false
     }
     Add-AuditCheck 'ssh-host-key-acls' $hostKeysOk 'private host keys: SYSTEM and Administrators only'
-    $generatedHostKeysOk = $true
-    foreach ($record in @($state.generatedHostKeyFiles)) {
-        $path = Join-Path $script:SshPath ([string]$record.name)
-        if ((-not (Test-Path -LiteralPath $path -PathType Leaf)) -or
-            ((Get-FileSha256 -Path $path) -ne [string]$record.sha256)) {
-            $generatedHostKeysOk = $false
+    $hostKeySetOk = $true
+    try {
+        $expectedRecords = @(@($state.original.hostKeyFiles) + @($state.generatedHostKeyFiles) |
+            Sort-Object { ([string]$_.name).ToLowerInvariant() })
+        $currentRecords = @(Get-HostKeyFileRecords | Sort-Object { ([string]$_.name).ToLowerInvariant() })
+        if ($expectedRecords.Count -ne $currentRecords.Count) {
+            $hostKeySetOk = $false
+        } else {
+            for ($index = 0; $index -lt $expectedRecords.Count; $index++) {
+                if (([string]$expectedRecords[$index].name -ine [string]$currentRecords[$index].name) -or
+                    ([string]$expectedRecords[$index].sha256 -ne [string]$currentRecords[$index].sha256)) {
+                    $hostKeySetOk = $false
+                }
+            }
         }
+    } catch {
+        $hostKeySetOk = $false
     }
-    Add-AuditCheck 'generated-host-key-hashes' $generatedHostKeysOk 'all installer-generated host-key files unchanged'
+    Add-AuditCheck 'host-key-file-set-and-hashes' $hostKeySetOk 'original plus generated host-key files exactly unchanged'
     $currentHostFingerprint = Get-HostKeyFingerprint
     Add-AuditCheck 'host-key-fingerprint' `
         ([string]$currentHostFingerprint -eq [string]$state.hostKeyFingerprint) ([string]$currentHostFingerprint)
@@ -1468,6 +1800,7 @@ function Invoke-WindowsRemoteBootstrapAudit {
     $service = Get-Service -Name sshd -ErrorAction SilentlyContinue
     $serviceOk = ($null -ne $service) -and ($service.Status -eq 'Running') -and ([string]$service.StartType -eq 'Automatic')
     Add-AuditCheck 'sshd-service' $serviceOk $(if ($null -eq $service) { 'missing' } else { "$($service.Status)/$($service.StartType)" })
+    Add-AuditCheck 'sshd-service-identity' (Test-SshdServiceIdentity) 'System32 OpenSSH sshd.exe as LocalSystem'
 
     $listenerOk = Test-SshdListenerExact -SshPort ([int]$state.port)
     Add-AuditCheck 'sshd-listeners' $listenerOk "sshd PID only TCP/$($state.port)"
@@ -1479,7 +1812,7 @@ function Invoke-WindowsRemoteBootstrapAudit {
     $profilesOk = $true
     $competing = @()
     try {
-        $profilesOk = @(Get-NetFirewallProfile | Where-Object { [string]$_.Enabled -ne 'True' }).Count -eq 0
+        $profilesOk = @(Get-NetFirewallProfile -PolicyStore ActiveStore | Where-Object { [string]$_.Enabled -ne 'True' }).Count -eq 0
         $competing = @(Get-CompetingSshFirewallRules -SshPort ([int]$state.port) -SshdExe $sshdPath)
     } catch {
         $profilesOk = $false
@@ -1487,7 +1820,7 @@ function Invoke-WindowsRemoteBootstrapAudit {
     Add-AuditCheck 'firewall-profiles-enabled' $profilesOk ([string]$profilesOk)
     Add-AuditCheck 'no-competing-firewall-rule' ($competing.Count -eq 0) ($competing -join ', ')
 
-    $defaultRules = @(Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)
+    $defaultRules = @(Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -PolicyStore ActiveStore -ErrorAction SilentlyContinue)
     $enabledDefaultRules = @($defaultRules | Where-Object { [string]$_.Enabled -eq 'True' })
     $defaultRuleOk = $enabledDefaultRules.Count -eq 0
     Add-AuditCheck 'default-wide-firewall-disabled' $defaultRuleOk $(if ($defaultRules.Count -eq 0) { 'absent' } else { (@($defaultRules.Enabled) -join ',') })
@@ -1551,13 +1884,9 @@ function Uninstall-WindowsRemoteBootstrap {
     }
 
     Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
-    Get-NetFirewallRule -Name $script:FirewallRuleName -ErrorAction SilentlyContinue |
+    Get-NetFirewallRule -Name $script:FirewallRuleName -PolicyStore PersistentStore -ErrorAction SilentlyContinue |
         Remove-NetFirewallRule -ErrorAction Stop
     Invoke-TestHook -Stage 'uninstall-firewall'
-
-    Restore-ConfigSnapshot -Snapshot $state.original.config
-    Invoke-TestHook -Stage 'uninstall-config'
-    Restore-DefaultFirewallSnapshot -Snapshot $state.original.defaultFirewall
 
     $user = Get-LocalUser -Name ([string]$state.accountName) -ErrorAction SilentlyContinue
     if ($null -ne $user) {
@@ -1574,27 +1903,46 @@ function Uninstall-WindowsRemoteBootstrap {
         Remove-GeneratedHostKeys -Records @($state.generatedHostKeyFiles)
     }
 
+    $restartRequired = $false
     if ($removeCapability) {
         $capability = Get-WindowsCapability -Online -Name $script:CapabilityName
         if ($capability.State -eq 'Installed') {
             $removeResult = Remove-WindowsCapability -Online -Name $script:CapabilityName
             if ($removeResult.RestartNeeded) {
-                $state.status = 'uninstall-restart-required'
-                Write-ProtectedJsonFile -Value $state -Path $script:StatePath
-                return [ordered]@{
-                    status = 'uninstall-restart-required'
-                    installerVersion = $script:InstallerVersion
-                    computerName = $env:COMPUTERNAME
-                    nextStep = 'Restart Windows, then run the exact same uninstall command.'
-                }
+                $restartRequired = $true
             }
         }
+    }
+
+    Restore-ConfigSnapshot -Snapshot $state.original.config
+    Invoke-TestHook -Stage 'uninstall-config'
+    Restore-DefaultFirewallSnapshot -Snapshot $state.original.defaultFirewall
+    $removeSshDirectory = (-not [bool]$state.original.sshDirectory.existed) -and
+        ([bool]$state.original.capabilityInstalled -or ($removeCapability -and (-not $restartRequired)))
+    Restore-SshDirectorySnapshot -Snapshot $state.original.sshDirectory `
+        -RemoveIfOriginallyAbsent $removeSshDirectory
+    if ([bool]$state.original.sshDirectory.existed) {
+        if ([bool]$state.original.config.existed) {
+            Set-SecurityDescriptorFromSnapshot -Path $script:SshConfigPath -Snapshot $state.original.config
+        }
+        Restore-OriginalHostKeySecurity -Records @($state.original.hostKeyFiles)
     }
 
     if ([bool]$state.original.capabilityInstalled) {
         Restore-ServiceSnapshot -Snapshot $state.original.service
     } else {
         Restore-ServiceSnapshot -Snapshot ([ordered]@{ existed = $false; status = $null; startType = $null })
+    }
+
+    if ($restartRequired) {
+        $state.status = 'uninstall-restart-required'
+        Write-ProtectedJsonFile -Value $state -Path $script:StatePath
+        return [ordered]@{
+            status = 'uninstall-restart-required'
+            installerVersion = $script:InstallerVersion
+            computerName = $env:COMPUTERNAME
+            nextStep = 'Restart Windows, then run the exact same uninstall command.'
+        }
     }
 
     Remove-Item -LiteralPath $script:KeyPath -Force -ErrorAction SilentlyContinue
@@ -1623,7 +1971,14 @@ try {
     }
 
     $mutex = New-Object Threading.Mutex($false, 'Global\WindowsRemoteBootstrap.Setup')
-    $mutexAcquired = $mutex.WaitOne(0)
+    try {
+        $mutexAcquired = $mutex.WaitOne(0)
+    } catch [Threading.AbandonedMutexException] {
+        # WaitOne grants ownership before reporting that the previous process
+        # died. Treat it as acquired so recovery can proceed and finally can
+        # release it normally.
+        $mutexAcquired = $true
+    }
     if (-not $mutexAcquired) {
         throw 'Another WindowsRemoteBootstrap operation is already running.'
     }
