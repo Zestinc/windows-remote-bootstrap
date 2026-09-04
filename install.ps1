@@ -455,10 +455,12 @@ function ConvertTo-UnsignedAccessMask {
     param([Parameter(Mandatory = $true)][int]$AccessMask)
 
     # AccessMask is exposed as a signed Int32 in Windows PowerShell 5.1.
-    # Preserve its raw 32 bits so generic access flags cannot be hidden by a
-    # signed conversion or by FileSystemRights enum projection.
-    return [int64][BitConverter]::ToUInt32(
-        [BitConverter]::GetBytes($AccessMask), 0)
+    # Promote first, then add 2^32 for a negative value. This preserves its
+    # raw bits without relying on PowerShell 5.1's ambiguous BitConverter
+    # overload binding.
+    $result = [int64]$AccessMask
+    if ($result -lt 0) { $result += [int64]4294967296 }
+    return $result
 }
 
 function Test-RawFileSystemAllowAces {
@@ -1231,12 +1233,15 @@ function Test-ProtectedSystemExecutable {
         if (-not (Test-ProtectedPathIdentityChain -Path $actual)) { return $false }
 
         $directory = Split-Path -Parent $actual
+        $windowsDirectory = Split-Path -Parent $script:SystemPath
         if ((-not (Test-Path -LiteralPath $directory -PathType Container)) -or
             (Test-ReparsePoint -Path $directory) -or
             (-not (Test-PathProtectedFromUntrustedMutation -Path $directory -FixedTrustedOnly $true)) -or
             (-not (Test-ParentProtectsChildFromUntrustedReplacement -ChildPath $directory -FixedTrustedOnly $true)) -or
             (-not (Test-PathProtectedFromUntrustedMutation -Path $actual -FixedTrustedOnly $true)) -or
-            (-not (Test-ParentProtectsChildFromUntrustedReplacement -ChildPath $actual -FixedTrustedOnly $true))) {
+            (-not (Test-ParentProtectsChildFromUntrustedReplacement -ChildPath $actual -FixedTrustedOnly $true)) -or
+            (-not (Test-PathProtectedFromUntrustedMutation -Path $script:SystemPath -FixedTrustedOnly $true)) -or
+            (-not (Test-PathProtectedFromUntrustedMutation -Path $windowsDirectory -FixedTrustedOnly $true))) {
             return $false
         }
         return $true
