@@ -71,6 +71,9 @@ uninstall only when the receipt proves this tool installed it.
 It never suppresses first-connection host-key verification.
 
 ```bash
+curl -fL -o winctl https://github.com/Zestinc/windows-remote-bootstrap/releases/download/v1.0.0/winctl
+printf '%s  %s\n' e8a7f37f3a00ed1934a78a3f63006a15af895ad14c65c04211815406ad386760 winctl | shasum -a 256 -c -
+chmod +x winctl
 ./winctl 192.168.1.50 status
 ./winctl 192.168.1.50 display 15 5
 ./winctl 192.168.1.50 sleep 60 30
