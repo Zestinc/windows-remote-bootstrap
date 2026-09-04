@@ -13,7 +13,12 @@ $required = @(
     "OpenSSH.Server~~~~0.0.1.0",
     "TypeOfAdminApprovalMode",
     "OpenSSH-Server-In-TCP",
-    "RemoteAddress"
+    "RemoteAddress",
+    "transaction.json",
+    "Test-EffectiveSshPolicy",
+    "managedConfigSha256",
+    "hostKeyFingerprint",
+    "Set-ExactAcl"
 )
 foreach ($needle in $required) {
     if (-not $text.Contains($needle)) {
@@ -25,7 +30,9 @@ $forbidden = @(
     'LocalAccountTokenFilterPolicy',
     'administrators_authorized_keys',
     'PasswordAuthentication yes',
-    '-RemoteAddress Any'
+    '-RemoteAddress Any',
+    'Invoke-SelfElevation',
+    "'/grant:r'"
 )
 foreach ($needle in $forbidden) {
     if ($text.Contains($needle)) {

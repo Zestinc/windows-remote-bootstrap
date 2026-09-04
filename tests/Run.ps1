@@ -60,8 +60,9 @@ try {
     Invoke-Installer -Arguments $installArguments
 
     $config = Get-Content -LiteralPath "$env:ProgramData\ssh\sshd_config" -Raw
-    Assert-True (([regex]::Matches($config, '# BEGIN WINDOWS-REMOTE-BOOTSTRAP GLOBAL')).Count -eq 1) 'global marker must be unique after a second install'
-    Assert-True (([regex]::Matches($config, '# BEGIN WINDOWS-REMOTE-BOOTSTRAP USER')).Count -eq 1) 'user marker must be unique after a second install'
+    Assert-True (([regex]::Matches($config, '# BEGIN WINDOWS-REMOTE-BOOTSTRAP MANAGED CONFIG')).Count -eq 1) 'managed config marker must be unique after a second install'
+    Assert-True (-not $config.Contains('Match ')) 'managed config must not preserve Match blocks'
+    Assert-True (-not $config.Contains('Include ')) 'managed config must not preserve Include directives'
 
     $ssh = Join-Path $env:SystemRoot 'System32\OpenSSH\ssh.exe'
     $sshArguments = @(
@@ -96,6 +97,9 @@ try {
     Write-Output 'All native Windows tests passed.'
 } finally {
     if (Test-Path -LiteralPath 'C:\ProgramData\WindowsRemoteBootstrap\state.json') {
+        $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $installer -Mode Uninstall
+    } elseif (Test-Path -LiteralPath 'C:\ProgramData\WindowsRemoteBootstrap\transaction.json') {
         $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $installer -Mode Uninstall
     }
