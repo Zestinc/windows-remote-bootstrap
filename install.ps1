@@ -597,6 +597,7 @@ function Test-ProtectedPathIdentityChain {
             $ownerSid = ConvertTo-SidValue -IdentityReference $acl.Owner
             if ([string]::IsNullOrWhiteSpace($ownerSid) -or
                 (-not (Test-FixedTrustedSystemSid -Sid $ownerSid))) {
+                $script:LastSecurityBoundaryError = "untrusted identity-chain owner on '$($current.FullName)': '$ownerSid'"
                 return $false
             }
             # The object itself cannot be deleted or have ownership/DACL
@@ -613,6 +614,7 @@ function Test-ProtectedPathIdentityChain {
         }
         return $true
     } catch {
+        $script:LastSecurityBoundaryError = "identity-chain query failed for '$Path': $($_.Exception.Message); $($_.ScriptStackTrace)"
         return $false
     }
 }
@@ -1225,28 +1227,44 @@ function Test-ProtectedSystemExecutable {
     param([Parameter(Mandatory = $true)][string]$Path)
 
     try {
+        $script:LastSecurityBoundaryError = ''
         $actual = [IO.Path]::GetFullPath($Path).TrimEnd('\')
         $systemRoot = [IO.Path]::GetFullPath($script:SystemPath).TrimEnd('\') + '\'
-        if (-not $actual.StartsWith($systemRoot, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+        if (-not $actual.StartsWith($systemRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            $script:LastSecurityBoundaryError = "executable is outside canonical System32: '$actual'"
+            return $false
+        }
         if ((-not (Test-Path -LiteralPath $actual -PathType Leaf)) -or
-            (Test-ReparsePoint -Path $actual)) { return $false }
+            (Test-ReparsePoint -Path $actual)) {
+            $script:LastSecurityBoundaryError = "executable is missing, not a leaf, or a reparse point: '$actual'"
+            return $false
+        }
         Assert-NoReparseAncestors -Path $actual
         if (-not (Test-ProtectedPathIdentityChain -Path $actual)) { return $false }
 
         $directory = Split-Path -Parent $actual
         $windowsDirectory = Split-Path -Parent $script:SystemPath
         if ((-not (Test-Path -LiteralPath $directory -PathType Container)) -or
-            (Test-ReparsePoint -Path $directory) -or
-            (-not (Test-PathProtectedFromUntrustedMutation -Path $directory -FixedTrustedOnly $true)) -or
-            (-not (Test-ParentProtectsChildFromUntrustedReplacement -ChildPath $directory -FixedTrustedOnly $true)) -or
-            (-not (Test-PathProtectedFromUntrustedMutation -Path $actual -FixedTrustedOnly $true)) -or
-            (-not (Test-ParentProtectsChildFromUntrustedReplacement -ChildPath $actual -FixedTrustedOnly $true)) -or
-            (-not (Test-PathProtectedFromUntrustedMutation -Path $script:SystemPath -FixedTrustedOnly $true)) -or
-            (-not (Test-PathProtectedFromUntrustedMutation -Path $windowsDirectory -FixedTrustedOnly $true))) {
+            (Test-ReparsePoint -Path $directory)) {
+            $script:LastSecurityBoundaryError = "OpenSSH executable directory is missing or a reparse point: '$directory'"
             return $false
+        }
+        foreach ($protectedPath in @($directory, $actual, $script:SystemPath, $windowsDirectory)) {
+            if (-not (Test-PathProtectedFromUntrustedMutation -Path $protectedPath -FixedTrustedOnly $true)) {
+                $script:LastSecurityBoundaryError = "unsafe system path '$protectedPath': $script:LastSecurityBoundaryError"
+                return $false
+            }
+        }
+        foreach ($protectedChild in @($directory, $actual)) {
+            if (-not (Test-ParentProtectsChildFromUntrustedReplacement `
+                    -ChildPath $protectedChild -FixedTrustedOnly $true)) {
+                $script:LastSecurityBoundaryError = "replaceable system path '$protectedChild': $script:LastSecurityBoundaryError"
+                return $false
+            }
         }
         return $true
     } catch {
+        $script:LastSecurityBoundaryError = "system executable proof failed for '$Path': $($_.Exception.Message); $($_.ScriptStackTrace)"
         return $false
     }
 }
@@ -2168,6 +2186,7 @@ namespace WindowsRemoteBootstrap
 
 function Test-SshdServiceObjectSecurity {
     try {
+        $script:LastSecurityBoundaryError = ''
         [byte[]]$bytes = Get-ServiceSecurityDescriptor -Name 'sshd'
         $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($bytes, 0)
         if (($null -eq $descriptor.Owner) -or
@@ -2175,6 +2194,8 @@ function Test-SshdServiceObjectSecurity {
             (($descriptor.ControlFlags -band
                     [Security.AccessControl.ControlFlags]::DiscretionaryAclPresent) -eq 0) -or
             ($null -eq $descriptor.DiscretionaryAcl)) {
+            $owner = if ($null -eq $descriptor.Owner) { '<null>' } else { [string]$descriptor.Owner.Value }
+            $script:LastSecurityBoundaryError = "sshd owner/DACL is invalid: owner='$owner'"
             return $false
         }
 
@@ -2185,28 +2206,41 @@ function Test-SshdServiceObjectSecurity {
             if (($ace -isnot [Security.AccessControl.CommonAce]) -or
                 $ace.IsCallback -or
                 ($ace.AceFlags -ne [Security.AccessControl.AceFlags]::None)) {
+                $script:LastSecurityBoundaryError = "sshd has an unsupported ACE: $($ace.GetType().FullName); flags=$($ace.AceFlags)"
                 return $false
             }
             if ($ace.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessDenied) { continue }
-            if ($ace.AceQualifier -ne [Security.AccessControl.AceQualifier]::AccessAllowed) { return $false }
+            if ($ace.AceQualifier -ne [Security.AccessControl.AceQualifier]::AccessAllowed) {
+                $script:LastSecurityBoundaryError = "sshd has an unsupported ACE qualifier: $($ace.AceQualifier)"
+                return $false
+            }
             $sid = [string]$ace.SecurityIdentifier.Value
             if (Test-FixedTrustedSystemSid -Sid $sid) { continue }
             $mask = ConvertTo-UnsignedAccessMask -AccessMask $ace.AccessMask
-            if (($mask -band $unsafeForUntrusted) -ne 0) { return $false }
+            if (($mask -band $unsafeForUntrusted) -ne 0) {
+                $script:LastSecurityBoundaryError = ('sshd has unsafe untrusted allow SID={0} mask=0x{1:x8}' -f $sid, $mask)
+                return $false
+            }
         }
         return $true
     } catch {
+        $script:LastSecurityBoundaryError = "sshd service security query failed: $($_.Exception.Message); $($_.ScriptStackTrace)"
         return $false
     }
 }
 
 function Test-SshdServiceSecurityBoundary {
     try {
-        if ($null -eq (Get-SshdServiceOrNull)) { return $false }
+        $script:LastSecurityBoundaryError = ''
+        if ($null -eq (Get-SshdServiceOrNull)) {
+            $script:LastSecurityBoundaryError = 'sshd service is missing'
+            return $false
+        }
         [void](Get-SshdExecutable)
         [void](Get-SshKeygenExecutable)
         return Test-SshdServiceObjectSecurity
     } catch {
+        $script:LastSecurityBoundaryError = "sshd service boundary proof failed: $($_.Exception.Message); $($_.ScriptStackTrace)"
         return $false
     }
 }
@@ -2772,9 +2806,11 @@ function New-InstallTransaction {
         throw "OpenSSH capability servicing is not in a stable state ($($capability.State)). Finish Windows servicing or restart, then retry."
     }
     $serviceSnapshot = Get-ServiceSnapshot
-    if ([bool]$serviceSnapshot.existed -and
-        ((-not (Test-SshdServiceIdentity)) -or (-not (Test-SshdServiceSecurityBoundary)))) {
-        throw 'The existing sshd service identity, DACL, or System32 OpenSSH binary boundary is unsafe.'
+    if ([bool]$serviceSnapshot.existed -and (-not (Test-SshdServiceIdentity))) {
+        throw 'The existing sshd service does not use the canonical LocalSystem/System32 identity.'
+    }
+    if ([bool]$serviceSnapshot.existed -and (-not (Test-SshdServiceSecurityBoundary))) {
+        throw "The existing sshd service identity, DACL, or System32 OpenSSH binary boundary is unsafe: $script:LastSecurityBoundaryError"
     }
     Assert-SafeExistingSshBaseline
     $sshDirectorySnapshot = Get-SshDirectorySnapshot
