@@ -345,6 +345,14 @@ function New-ManagedDirectoryProtectedAtCreation {
         (-not (Test-ManagedDirectoryAcl -Path $Path))) {
         throw "A newly created managed directory failed its exact ACL/type check: $Path"
     }
+    # The creation-time DACL closes the race, but Windows records it without
+    # the auto-inherited control flag (D:P...), while directories protected
+    # through Set-Acl carry D:PAI... . Re-apply the same exact ACL through
+    # Set-Acl so every managed directory has one canonical SDDL form.
+    Set-ExactAcl -Path $Path -AllowedSids @('S-1-5-18', 'S-1-5-32-544') -Directory $true
+    if (-not (Test-ManagedDirectoryAcl -Path $Path)) {
+        throw "A newly created managed directory failed its canonical ACL check: $Path"
+    }
 }
 
 function Assert-ManagedCleanupRoot {
