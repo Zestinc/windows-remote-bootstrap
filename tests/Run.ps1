@@ -20,8 +20,17 @@ function Invoke-Installer {
     param([string[]]$Arguments)
     $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $installer @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "Installer failed with exit code $LASTEXITCODE"
+    $installerExitCode = $LASTEXITCODE
+    if ($installerExitCode -ne 0) {
+        Get-Service -Name sshd -ErrorAction SilentlyContinue | Format-List Name, Status, StartType
+        Get-WinEvent -LogName 'OpenSSH/Operational' -MaxEvents 10 -ErrorAction SilentlyContinue |
+            Select-Object TimeCreated, Id, LevelDisplayName, Message | Format-List
+        if (Test-Path -LiteralPath "$env:ProgramData\ssh\sshd_config") {
+            Get-Content -LiteralPath "$env:ProgramData\ssh\sshd_config"
+        }
+        Get-ChildItem -LiteralPath "$env:ProgramData\ssh" -Filter 'ssh_host_*_key' -ErrorAction SilentlyContinue |
+            ForEach-Object { & "$env:SystemRoot\System32\icacls.exe" $_.FullName }
+        throw "Installer failed with exit code $installerExitCode"
     }
 }
 
@@ -61,6 +70,7 @@ try {
         '-o', 'BatchMode=yes',
         '-o', 'PasswordAuthentication=no',
         '-o', 'IdentitiesOnly=yes',
+        '-o', 'LogLevel=ERROR',
         '-o', 'StrictHostKeyChecking=no',
         '-o', "UserKnownHostsFile=$knownHosts",
         'macremote@127.0.0.1'

@@ -468,6 +468,17 @@ function Get-SshKeygenExecutable {
     return $candidate
 }
 
+function Protect-OpenSshHostKeys {
+    $privateHostKeys = @(Get-ChildItem -LiteralPath $script:SshPath -Filter 'ssh_host_*_key' -File -ErrorAction SilentlyContinue)
+    if ($privateHostKeys.Count -eq 0) {
+        throw 'OpenSSH did not generate any private host keys.'
+    }
+    foreach ($hostKey in $privateHostKeys) {
+        Invoke-Icacls $hostKey.FullName '/setowner' '*S-1-5-18' '/inheritance:r' '/grant:r' `
+            '*S-1-5-18:F' '*S-1-5-32-544:F'
+    }
+}
+
 function Test-SshConfig {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -648,14 +659,23 @@ function Install-WindowsRemoteBootstrap {
                 throw "OpenSSH default configuration was not found at $defaultConfig."
             }
             Copy-Item -LiteralPath $defaultConfig -Destination $script:SshConfigPath -Force
-            & (Get-SshKeygenExecutable) -A | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-                throw 'OpenSSH could not generate host keys.'
-            }
         }
         if (-not (Test-Path -LiteralPath $script:SshConfigPath)) {
             throw 'OpenSSH did not create sshd_config.'
         }
+
+        $privateHostKeys = @(Get-ChildItem -LiteralPath $script:SshPath -Filter 'ssh_host_*_key' -File -ErrorAction SilentlyContinue)
+        if ($privateHostKeys.Count -eq 0) {
+            Set-Service -Name sshd -StartupType Automatic
+            Start-Service -Name sshd
+            $hostKeyDeadline = (Get-Date).AddSeconds(15)
+            do {
+                Start-Sleep -Milliseconds 250
+                $privateHostKeys = @(Get-ChildItem -LiteralPath $script:SshPath -Filter 'ssh_host_*_key' -File -ErrorAction SilentlyContinue)
+            } while (($privateHostKeys.Count -eq 0) -and ((Get-Date) -lt $hostKeyDeadline))
+            Stop-Service -Name sshd -Force
+        }
+        Protect-OpenSshHostKeys
 
         $backupDirectory = Join-Path $script:RootPath 'backup'
         [void](New-Item -Path $backupDirectory -ItemType Directory -Force)
