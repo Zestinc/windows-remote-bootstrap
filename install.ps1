@@ -2190,8 +2190,7 @@ function Test-SshdServiceObjectSecurity {
             if ($ace.AceQualifier -ne [Security.AccessControl.AceQualifier]::AccessAllowed) { return $false }
             $sid = [string]$ace.SecurityIdentifier.Value
             if (Test-FixedTrustedSystemSid -Sid $sid) { continue }
-            $mask = [int64][BitConverter]::ToUInt32(
-                [BitConverter]::GetBytes([int]$ace.AccessMask), 0)
+            $mask = ConvertTo-UnsignedAccessMask -AccessMask ([int]$ace.AccessMask)
             if (($mask -band $unsafeForUntrusted) -ne 0) { return $false }
         }
         return $true
