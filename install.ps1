@@ -15,9 +15,7 @@ param(
 
     [string[]]$AllowedRemoteAddress = @('LocalSubnet'),
 
-    [switch]$TakeOverExistingSshd,
-
-    [switch]$RemoveOpenSshCapability
+    [switch]$TakeOverExistingSshd
 )
 
 Set-StrictMode -Version 2.0
@@ -58,8 +56,8 @@ $script:CleanupPhases = @(
     'service-stop',
     'firewall',
     'account',
-    'ssh-boundary',
     'capability',
+    'ssh-boundary',
     'config',
     'host-keys',
     'default-firewall',
@@ -641,6 +639,7 @@ function Establish-SshDirectoryBoundary {
             ((Get-FileSha256 -Path $candidateMarker) -ne [string]$Transaction.sshDirectoryMarkerSha256)) {
             throw 'The protected OpenSSH directory candidate failed validation.'
         }
+        Invoke-TestHook -Stage 'ssh-directory-before-publish'
         [IO.Directory]::Move($candidatePath, $script:SshPath)
     } finally {
         if ((Test-Path -LiteralPath $candidatePath -PathType Container) -and
@@ -1298,6 +1297,7 @@ function Get-FirewallRuleSemanticSha256 {
         name = [string]$Rule.Name
         displayName = [string]$Rule.DisplayName
         description = [string]$Rule.Description
+        ruleGroup = Get-OptionalPropertyText -Object $Rule -Name 'RuleGroup'
         direction = [string]$Rule.Direction
         action = [string]$Rule.Action
         profile = [string]$Rule.Profile
@@ -1357,7 +1357,7 @@ function Test-FirewallProfilesSecure {
                 -not [string]::IsNullOrWhiteSpace([string]$_)
             })
         if (([string]$profile.Enabled -ne 'True') -or
-            ([string]$profile.DefaultInboundAction -notin @('Block', '0')) -or
+            ([string]$profile.DefaultInboundAction -notin @('Block', '4')) -or
             ($disabledAliases.Count -gt 0)) {
             return $false
         }
@@ -1484,11 +1484,12 @@ function Test-ManagedFirewallRule {
         ([string]$rule.LocalOnlyMapping -notin @('False', '0')) -or
         ([string]$rule.DisplayName -ne 'Windows Remote Bootstrap - SSH (restricted)') -or
         ([string]$rule.Description -ne "Managed by WindowsRemoteBootstrap; $Marker") -or
+        (-not [string]::IsNullOrWhiteSpace((Get-OptionalPropertyText -Object $rule -Name 'RuleGroup'))) -or
         (-not [string]::IsNullOrWhiteSpace((Get-OptionalPropertyText -Object $rule -Name 'Owner'))) -or
         (-not [string]::IsNullOrWhiteSpace((Get-OptionalPropertyText -Object $rule -Name 'PackageFamilyName'))) -or
-        ((Get-OptionalPropertyValues -Object $rule -Name 'Platforms').Count -gt 0) -or
-        ((Get-OptionalPropertyValues -Object $rule -Name 'PolicyAppId').Count -gt 0) -or
-        ((Get-OptionalPropertyValues -Object $rule -Name 'RemoteDynamicKeywordAddresses').Count -gt 0)) {
+        (@(Get-OptionalPropertyValues -Object $rule -Name 'Platforms').Count -gt 0) -or
+        (@(Get-OptionalPropertyValues -Object $rule -Name 'PolicyAppId').Count -gt 0) -or
+        (@(Get-OptionalPropertyValues -Object $rule -Name 'RemoteDynamicKeywordAddresses').Count -gt 0)) {
         return $false
     }
     if ($PolicyStore -eq 'ActiveStore') {
@@ -1514,7 +1515,7 @@ function Test-ManagedFirewallRule {
         return $false
     }
     $serviceFilter = $rule | Get-NetFirewallServiceFilter -ErrorAction Stop
-    if (($null -ne $serviceFilter) -and ([string]$serviceFilter.Service -ne 'Any')) { return $false }
+    if (($null -eq $serviceFilter) -or ([string]$serviceFilter.Service -ne 'Any')) { return $false }
     $interfaceFilter = $rule | Get-NetFirewallInterfaceFilter -ErrorAction Stop
     if (($null -eq $interfaceFilter) -or ([string]$interfaceFilter.InterfaceAlias -ne 'Any')) { return $false }
     $interfaceTypeFilter = $rule | Get-NetFirewallInterfaceTypeFilter -ErrorAction Stop
@@ -1738,7 +1739,7 @@ function Restore-ConfigSnapshot {
     $temporaryPath = Get-ConfigRestoreStagePath -Record $Record
     if (-not [bool]$snapshot.existed) {
         if (Test-Path -LiteralPath $script:SshConfigPath) {
-            $owned = (Test-ManagedConfigCurrent -Record $Record)
+            $owned = (Test-ManagedConfigContentProtected -Record $Record)
             if (($null -ne $Record.PSObject.Properties['preManagedConfig']) -and
                 ($null -ne $Record.preManagedConfig)) {
                 $owned = $owned -or (Test-ConfigMatchesSnapshot -Snapshot $Record.preManagedConfig)
@@ -1776,11 +1777,19 @@ function Restore-ConfigSnapshot {
     if (Test-Path -LiteralPath $temporaryPath) {
         if ((-not (Test-Path -LiteralPath $temporaryPath -PathType Leaf)) -or
             (Test-ReparsePoint -Path $temporaryPath) -or
-            (-not (Test-PathProtectedFromUntrustedMutation -Path $temporaryPath)) -or
-            ((Get-FileSha256 -Path $temporaryPath) -ne [string]$snapshot.sha256)) {
-            throw 'The deterministic config restoration stage changed identity or content.'
+            (-not (Test-PathProtectedFromUntrustedMutation -Path $temporaryPath))) {
+            throw 'The deterministic config restoration stage changed identity.'
         }
-    } else {
+        # A hard stop can interrupt WriteAllBytes before the stage is complete.
+        # The protected journal remains authoritative, so discard only this
+        # safely contained partial stage and deterministically rebuild it.
+        if ((Get-FileSha256 -Path $temporaryPath) -ne [string]$snapshot.sha256) {
+            [IO.File]::Delete($temporaryPath)
+        } elseif (-not (Test-ManagedFileAcl -Path $temporaryPath)) {
+            Protect-ManagedFile -Path $temporaryPath
+        }
+    }
+    if (-not (Test-Path -LiteralPath $temporaryPath)) {
         [IO.File]::WriteAllBytes($temporaryPath, [Convert]::FromBase64String([string]$snapshot.bytesBase64))
         Protect-ManagedFile -Path $temporaryPath
         if ((Get-FileSha256 -Path $temporaryPath) -ne [string]$snapshot.sha256) {
@@ -1960,6 +1969,8 @@ function Assert-SnapshotShape {
     if ([bool]$Original.sshDirectory.existed) {
         Assert-ValidSecurityDescriptor -Sddl ([string]$Original.sshDirectory.sddl)
         try { [void][int]$Original.sshDirectory.attributes } catch { throw 'Invalid OpenSSH directory attributes.' }
+    } elseif ([bool]$Original.config.existed -or (@($Original.hostKeyFiles).Count -ne 0)) {
+        throw 'An absent OpenSSH directory baseline cannot contain config or host-key files.'
     }
     if ([bool]$Original.defaultFirewall.existed -and
         ([string]$Original.defaultFirewall.semanticSha256 -notmatch '^[0-9a-f]{64}$')) {
@@ -2090,7 +2101,6 @@ function Assert-StateShape {
         ($State.cleanupRemoveCapability -isnot [bool])) {
         throw 'Invalid uninstall cleanup journal.'
     }
-    if ($State.uninstallRemoveCapability -isnot [bool]) { throw 'Invalid uninstall capability choice in managed state.' }
     if (-not [string]::IsNullOrWhiteSpace([string]$State.createdDefaultFirewallSemanticSha256) -and
         ([string]$State.createdDefaultFirewallSemanticSha256 -notmatch '^[0-9a-f]{64}$')) {
         throw 'Invalid managed default firewall semantic hash.'
@@ -2449,28 +2459,36 @@ function Assert-InstallTransactionRollbackSafe {
 
     Assert-TransactionShape -Transaction $Transaction
     if (Test-InstallPhaseReached -Transaction $Transaction -Phase 'ssh-directory') {
+        if ([bool]$Transaction.original.sshDirectory.existed) {
+            Assert-ExistingSshDirectoryUnchanged -Record $Transaction
+        }
         $boundaryRetired = (Get-CleanupPhaseIndex -Phase ([string]$Transaction.cleanupPhase)) -ge
             (Get-CleanupPhaseIndex -Phase 'ssh-boundary')
         if ($boundaryRetired) {
             if ([bool]$Transaction.original.sshDirectory.existed) {
-                if ((-not (Test-Path -LiteralPath $script:SshPath -PathType Container)) -or
-                    (Test-ReparsePoint -Path $script:SshPath) -or
-                    (-not (Test-OwnedMarkerAtPath -Path (Get-RetiredSshMarkerPath) -Record $Transaction))) {
-                    if ([string]$Transaction.phase -ne 'ssh-directory') {
+                Assert-ExistingSshDirectoryUnchanged -Record $Transaction
+                $activeMarker = Get-SshOwnershipMarkerPath
+                $retiredMarker = Get-RetiredSshMarkerPath
+                $unpublished = ([string]$Transaction.phase -eq 'ssh-directory') -and
+                    (-not (Test-Path -LiteralPath $activeMarker)) -and
+                    (-not (Test-Path -LiteralPath $retiredMarker))
+                if (-not $unpublished) {
+                    if ((Test-Path -LiteralPath $activeMarker) -or
+                        (-not (Test-OwnedMarkerAtPath -Path $retiredMarker -Record $Transaction))) {
                         throw 'The retired OpenSSH marker boundary changed during rollback.'
                     }
                 }
             } else {
                 $retired = Get-RetiredSshDirectoryPath
-                $unclaimed = ([string]$Transaction.phase -eq 'ssh-directory') -and
-                    (Test-Path -LiteralPath $script:SshPath) -and
-                    (-not (Test-Path -LiteralPath (Get-SshOwnershipMarkerPath)))
-                if (-not $unclaimed) {
+                $unpublished = ([string]$Transaction.phase -eq 'ssh-directory') -and
+                    (-not (Test-Path -LiteralPath $script:SshPath)) -and
+                    (-not (Test-Path -LiteralPath $retired))
+                if (-not $unpublished) {
                     if ((Test-Path -LiteralPath $script:SshPath) -or
                         (-not (Test-Path -LiteralPath $retired -PathType Container))) {
                         throw 'The retired OpenSSH directory boundary changed during rollback.'
                     }
-                    Assert-OwnedTreeSafeToDelete -Path $retired
+                    Assert-NewSshTreeOwned -Path $retired -Record $Transaction -Kind rollback
                 }
             }
         } elseif (Test-Path -LiteralPath $script:SshPath) {
@@ -2675,6 +2693,170 @@ function Test-OwnedMarkerAtPath {
         ((Get-FileSha256 -Path $Path) -eq [string]$Record.sshDirectoryMarkerSha256)
 }
 
+function Assert-ExistingSshDirectoryUnchanged {
+    param([Parameter(Mandatory = $true)]$Record)
+
+    if (-not [bool]$Record.original.sshDirectory.existed) {
+        throw 'An existing-directory comparison was requested for an absent baseline.'
+    }
+    if ((-not (Test-Path -LiteralPath $script:SshPath -PathType Container)) -or
+        (Test-ReparsePoint -Path $script:SshPath) -or
+        (-not (Test-ParentProtectsChildFromUntrustedReplacement -ChildPath $script:SshPath)) -or
+        (-not (Test-PathProtectedFromUntrustedMutation -Path $script:SshPath)) -or
+        ((Get-Acl -LiteralPath $script:SshPath).Sddl -ne [string]$Record.original.sshDirectory.sddl) -or
+        ([int](Get-Item -LiteralPath $script:SshPath -Force).Attributes -ne
+            [int]$Record.original.sshDirectory.attributes)) {
+        throw 'The pre-existing OpenSSH directory metadata changed; refusing to overwrite it.'
+    }
+}
+
+function Test-FileMatchesSnapshotAtPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)]$Snapshot
+    )
+
+    if (-not [bool]$Snapshot.existed) { return -not (Test-Path -LiteralPath $Path) }
+    return (Test-Path -LiteralPath $Path -PathType Leaf) -and
+        (-not (Test-ReparsePoint -Path $Path)) -and
+        ((Get-FileSha256 -Path $Path) -eq [string]$Snapshot.sha256) -and
+        ((Get-Acl -LiteralPath $Path).Sddl -eq [string]$Snapshot.sddl) -and
+        ([int](Get-Item -LiteralPath $Path -Force).Attributes -eq [int]$Snapshot.attributes)
+}
+
+function Test-ProtectedFileRecordAtPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)]$Record
+    )
+
+    return (Test-Path -LiteralPath $Path -PathType Leaf) -and
+        (-not (Test-ReparsePoint -Path $Path)) -and
+        ((Get-FileSha256 -Path $Path) -eq [string]$Record.sha256) -and
+        ((Get-Acl -LiteralPath $Path).Sddl -eq [string]$Record.sddl) -and
+        ([int](Get-Item -LiteralPath $Path -Force).Attributes -eq [int]$Record.attributes)
+}
+
+function Assert-NewSshTreeOwned {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)]$Record,
+        [ValidateSet('rollback', 'uninstall', 'audit')][string]$Kind
+    )
+
+    if ([bool]$Record.original.sshDirectory.existed) {
+        throw 'A newly-created-directory proof was requested for an existing baseline.'
+    }
+    if ((-not (Test-Path -LiteralPath $Path -PathType Container)) -or
+        (Test-ReparsePoint -Path $Path) -or
+        (-not (Test-ManagedDirectoryAcl -Path $Path))) {
+        throw "The transaction-created OpenSSH directory changed identity: $Path"
+    }
+
+    $children = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)
+    foreach ($child in $children) {
+        if ($child.PSIsContainer -or (Test-ReparsePoint -Path $child.FullName)) {
+            throw "The transaction-created OpenSSH directory contains an unowned directory or reparse point: $($child.FullName)"
+        }
+    }
+
+    $markerName = $script:SshOwnershipMarkerName.ToLowerInvariant()
+    $configName = 'sshd_config'
+    $markerCount = 0
+    $configCount = 0
+    $hostChildren = New-Object System.Collections.ArrayList
+    foreach ($child in $children) {
+        $name = ([string]$child.Name).ToLowerInvariant()
+        if ($name -eq $markerName) {
+            $markerCount++
+            if (-not (Test-OwnedMarkerAtPath -Path $child.FullName -Record $Record)) {
+                throw 'The transaction-created OpenSSH directory marker changed.'
+            }
+        } elseif ($name -eq $configName) {
+            $configCount++
+        } elseif ($name -match '^ssh_host_[a-z0-9._-]+$') {
+            [void]$hostChildren.Add($child)
+        } else {
+            throw "The transaction-created OpenSSH directory contains an unowned file: $($child.FullName)"
+        }
+    }
+    if ($markerCount -ne 1) { throw 'The transaction-created OpenSSH directory must contain exactly one ownership marker.' }
+    if ($configCount -gt 1) { throw 'The transaction-created OpenSSH directory contains an ambiguous sshd_config.' }
+
+    $configPath = Join-Path $Path 'sshd_config'
+    $preManaged = $null
+    if (($null -ne $Record.PSObject.Properties['preManagedConfig']) -and ($null -ne $Record.preManagedConfig)) {
+        $preManaged = $Record.preManagedConfig
+    }
+    $managedExact = (Test-Path -LiteralPath $configPath -PathType Leaf) -and
+        (-not (Test-ReparsePoint -Path $configPath)) -and
+        ((Get-FileSha256 -Path $configPath) -eq [string]$Record.managedConfigSha256) -and
+        (Test-ManagedFileAcl -Path $configPath) -and
+        ([int](Get-Item -LiteralPath $configPath -Force).Attributes -eq [int][IO.FileAttributes]::Normal)
+    $managedProtected = (Test-Path -LiteralPath $configPath -PathType Leaf) -and
+        (-not (Test-ReparsePoint -Path $configPath)) -and
+        ((Get-FileSha256 -Path $configPath) -eq [string]$Record.managedConfigSha256) -and
+        (Test-PathProtectedFromUntrustedMutation -Path $configPath)
+    $preManagedExact = ($null -ne $preManaged) -and [bool]$preManaged.existed -and
+        (Test-FileMatchesSnapshotAtPath -Path $configPath -Snapshot $preManaged)
+
+    if ($Kind -in @('uninstall', 'audit')) {
+        if (($configCount -ne 1) -or (-not $managedExact)) {
+            throw 'The installed sshd_config is not the exact transaction-owned file.'
+        }
+    } else {
+        $phaseIndex = Get-InstallPhaseIndex -Phase ([string]$Record.phase)
+        $configPhase = Get-InstallPhaseIndex -Phase 'config'
+        if ($phaseIndex -lt $configPhase) {
+            if (($null -ne $preManaged) -and [bool]$preManaged.existed) {
+                if (($configCount -ne 1) -or (-not $preManagedExact)) {
+                    throw 'The pre-managed sshd_config changed before rollback.'
+                }
+            } elseif ($configCount -ne 0) {
+                throw 'An unowned sshd_config appeared before the config phase.'
+            }
+        } elseif ($phaseIndex -eq $configPhase) {
+            if (($configCount -eq 1) -and (-not ($managedProtected -or $preManagedExact))) {
+                throw 'The interrupted sshd_config publication is not a recorded transaction state.'
+            }
+        } elseif (($configCount -ne 1) -or (-not $managedExact)) {
+            throw 'The committed managed sshd_config changed before rollback.'
+        }
+    }
+
+    $expectedRecords = @()
+    $requireAllHostKeys = $false
+    if ($Kind -in @('uninstall', 'audit')) {
+        $expectedRecords = @($Record.generatedHostKeyFiles)
+        $requireAllHostKeys = $true
+    } else {
+        $hostPhase = Get-InstallPhaseIndex -Phase 'host-keys'
+        $phaseIndex = Get-InstallPhaseIndex -Phase ([string]$Record.phase)
+        if ($phaseIndex -lt $hostPhase) {
+            if ($hostChildren.Count -ne 0) { throw 'A host key appeared before the host-key publication phase.' }
+            return
+        }
+        $expectedRecords = @($Record.plannedHostKeyFiles)
+        $requireAllHostKeys = $phaseIndex -gt $hostPhase
+    }
+    $expectedByName = @{}
+    foreach ($expected in $expectedRecords) {
+        $expectedByName[([string]$expected.name).ToLowerInvariant()] = $expected
+    }
+    foreach ($child in @($hostChildren)) {
+        $key = ([string]$child.Name).ToLowerInvariant()
+        if (-not $expectedByName.ContainsKey($key)) {
+            throw "An unrecorded host key appeared in the transaction-created OpenSSH directory: $($child.Name)"
+        }
+        if (-not (Test-ProtectedFileRecordAtPath -Path $child.FullName -Record $expectedByName[$key])) {
+            throw "A transaction-owned host key changed: $($child.Name)"
+        }
+    }
+    if ($requireAllHostKeys -and ($hostChildren.Count -ne $expectedRecords.Count)) {
+        throw 'The transaction-owned host-key set is incomplete.'
+    }
+}
+
 function Assert-OwnedTreeSafeToDelete {
     param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -2707,6 +2889,7 @@ function Retire-SshDirectoryBoundary {
     }
 
     if ([bool]$Record.original.sshDirectory.existed) {
+        Assert-ExistingSshDirectoryUnchanged -Record $Record
         if (Test-Path -LiteralPath $retiredDirectory) {
             throw 'An unexpected retired OpenSSH directory exists for an existing-directory baseline.'
         }
@@ -2717,6 +2900,7 @@ function Retire-SshDirectoryBoundary {
             if (Test-Path -LiteralPath (Get-SshOwnershipMarkerPath)) {
                 throw 'Both active and retired OpenSSH markers exist.'
             }
+            Assert-ExistingSshDirectoryUnchanged -Record $Record
             return
         }
         $sourceMarker = Get-SshOwnershipMarkerPath
@@ -2742,7 +2926,7 @@ function Retire-SshDirectoryBoundary {
         if (Test-Path -LiteralPath $script:SshPath) {
             throw 'Both active and retired OpenSSH directories exist.'
         }
-        Assert-OwnedTreeSafeToDelete -Path $retiredDirectory
+        Assert-NewSshTreeOwned -Path $retiredDirectory -Record $Record -Kind $Kind
         $marker = Join-Path $retiredDirectory $script:SshOwnershipMarkerName
         if (-not (Test-OwnedMarkerAtPath -Path $marker -Record $Record)) {
             throw 'The retired OpenSSH directory lost its ownership marker.'
@@ -2756,19 +2940,133 @@ function Retire-SshDirectoryBoundary {
     if (-not (Test-SshDirectoryBoundary -Record $Record)) {
         if (($Kind -eq 'rollback') -and ([string]$Record.phase -eq 'ssh-directory') -and
             (-not (Test-Path -LiteralPath (Get-SshOwnershipMarkerPath)))) {
-            # A non-owned path raced with the forward claim. Never delete it.
-            return
+            throw 'An unowned OpenSSH path raced with directory publication; it was preserved for manual review.'
         }
         throw 'The active OpenSSH directory boundary changed before retirement.'
     }
+    Assert-NewSshTreeOwned -Path $script:SshPath -Record $Record -Kind $Kind
     [IO.Directory]::Move($script:SshPath, $retiredDirectory)
-    Assert-OwnedTreeSafeToDelete -Path $retiredDirectory
+    Assert-NewSshTreeOwned -Path $retiredDirectory -Record $Record -Kind $Kind
 }
 
 function Get-CleanupTombstonePath {
     param([Parameter(Mandatory = $true)][string]$TransactionId)
     if ($TransactionId -notmatch '^[0-9a-f]{32}$') { throw 'Invalid cleanup tombstone transaction ID.' }
     return Join-Path $env:ProgramData (".$($script:ProgramName).retired.$TransactionId")
+}
+
+function Get-CleanupRetiringPath {
+    param([Parameter(Mandatory = $true)][string]$TransactionId)
+    if ($TransactionId -notmatch '^[0-9a-f]{32}$') { throw 'Invalid cleanup retiring transaction ID.' }
+    return Join-Path $env:ProgramData (".$($script:ProgramName).retiring.$TransactionId")
+}
+
+function Get-CleanupAllowedRootNames {
+    param([Parameter(Mandatory = $true)][string]$TransactionId)
+    return @(
+        'state.json', 'transaction.json', 'authorized_keys',
+        'ssh-marker.retired', 'ssh-directory.retired',
+        "ssh-marker.$TransactionId.tmp", "ssh-directory.$TransactionId.tmp",
+        "authorized-keys.$TransactionId.staged", "sshd-config.$TransactionId.staged",
+        "host-key.$TransactionId.ssh_host_ed25519_key.staged",
+        "host-key.$TransactionId.ssh_host_ed25519_key.staged.pub",
+        "config-restore.$TransactionId.next"
+    )
+}
+
+function Get-CleanupRecordFromFrozenRoot {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$ExpectedId
+    )
+
+    $records = New-Object System.Collections.ArrayList
+    foreach ($entry in @(
+            [ordered]@{ name = 'state.json'; kind = 'state' },
+            [ordered]@{ name = 'transaction.json'; kind = 'transaction' }
+        )) {
+        $recordPath = Join-Path $Path ([string]$entry.name)
+        if (-not (Test-Path -LiteralPath $recordPath)) { continue }
+        if ((-not (Test-Path -LiteralPath $recordPath -PathType Leaf)) -or
+            (Test-ReparsePoint -Path $recordPath) -or
+            (-not (Test-ManagedFileAcl -Path $recordPath))) {
+            throw "A frozen cleanup journal changed identity: $recordPath"
+        }
+        $record = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
+        if ([string]$entry.kind -eq 'state') {
+            Assert-StateShape -State $record
+        } else {
+            Assert-TransactionShape -Transaction $record
+        }
+        if ([string]$record.transactionId -ne $ExpectedId) {
+            throw 'A frozen cleanup journal belongs to a different transaction.'
+        }
+        [void]$records.Add($record)
+    }
+    if ($records.Count -eq 0) { throw 'The frozen cleanup root has no trusted journal.' }
+    $cleanupRecords = @($records | Where-Object {
+            ([string]$_.cleanupPhase -eq 'root-retire') -and
+            ([string]$_.cleanupKind -in @('rollback', 'uninstall'))
+        })
+    if ($cleanupRecords.Count -ne 1) {
+        throw 'The frozen cleanup root does not contain one authoritative root-retire journal.'
+    }
+    return $cleanupRecords[0]
+}
+
+function Assert-CleanupRootReadyForRetirement {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)]$Record
+    )
+
+    Assert-OwnedTreeSafeToDelete -Path $Path
+    $id = [string]$Record.transactionId
+    if ($id -notmatch '^[0-9a-f]{32}$') { throw 'The cleanup record has an invalid transaction ID.' }
+    $allowedNames = @(Get-CleanupAllowedRootNames -TransactionId $id)
+    foreach ($child in @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)) {
+        if ([string]$child.Name -notin $allowedNames) {
+            throw "Protected cleanup root contains an unowned child: $($child.FullName)"
+        }
+    }
+
+    $keyPath = Join-Path $Path 'authorized_keys'
+    if (Test-Path -LiteralPath $keyPath) {
+        if ([string]$Record.authorizedKeysFileSha256 -notmatch '^[0-9a-f]{64}$' -or
+            (-not (Test-Path -LiteralPath $keyPath -PathType Leaf)) -or
+            (Test-ReparsePoint -Path $keyPath) -or
+            (-not (Test-ManagedFileAcl -Path $keyPath)) -or
+            ((Get-FileSha256 -Path $keyPath) -ne [string]$Record.authorizedKeysFileSha256)) {
+            throw 'The protected cleanup root contains an invalid authorized_keys file.'
+        }
+    }
+
+    $retiredMarker = Join-Path $Path 'ssh-marker.retired'
+    $retiredDirectory = Join-Path $Path 'ssh-directory.retired'
+    if ([bool]$Record.original.sshDirectory.existed) {
+        if (Test-Path -LiteralPath $retiredDirectory) {
+            throw 'An existing-directory cleanup unexpectedly contains a retired SSH tree.'
+        }
+        $boundaryWasOwned = ([string]$Record.cleanupKind -eq 'uninstall') -or
+            (Test-InstallPhaseReached -Transaction $Record -Phase 'ssh-directory')
+        $unpublished = ([string]$Record.cleanupKind -eq 'rollback') -and
+            ([string]$Record.phase -eq 'ssh-directory') -and
+            (-not (Test-Path -LiteralPath $retiredMarker))
+        if ($boundaryWasOwned -and (-not $unpublished) -and
+            (-not (Test-OwnedMarkerAtPath -Path $retiredMarker -Record $Record))) {
+            throw 'The frozen cleanup root lost its retired SSH marker.'
+        }
+    } else {
+        if (Test-Path -LiteralPath $retiredMarker) {
+            throw 'A new-directory cleanup unexpectedly contains a marker-only retirement.'
+        }
+        $unpublished = ([string]$Record.cleanupKind -eq 'rollback') -and
+            ([string]$Record.phase -eq 'ssh-directory') -and
+            (-not (Test-Path -LiteralPath $retiredDirectory))
+        if (-not $unpublished) {
+            Assert-NewSshTreeOwned -Path $retiredDirectory -Record $Record -Kind ([string]$Record.cleanupKind)
+        }
+    }
 }
 
 function Remove-CleanupTombstone {
@@ -2778,6 +3076,21 @@ function Remove-CleanupTombstone {
 }
 
 function Remove-StaleCleanupTombstones {
+    $retiringPattern = ".$($script:ProgramName).retiring.*"
+    foreach ($item in @(Get-ChildItem -LiteralPath $env:ProgramData -Filter $retiringPattern -Force -ErrorAction Stop)) {
+        if ((-not $item.PSIsContainer) -or
+            ([string]$item.Name -notmatch '^\.WindowsRemoteBootstrap\.retiring\.([0-9a-f]{32})$')) {
+            throw "An invalid retiring cleanup root blocks safe recovery: $($item.FullName)"
+        }
+        $id = [string]$Matches[1]
+        if (Test-Path -LiteralPath (Get-CleanupTombstonePath -TransactionId $id)) {
+            throw 'Both retiring and retired cleanup roots exist for one transaction.'
+        }
+        $record = Get-CleanupRecordFromFrozenRoot -Path $item.FullName -ExpectedId $id
+        Assert-CleanupRootReadyForRetirement -Path $item.FullName -Record $record
+        [IO.Directory]::Move($item.FullName, (Get-CleanupTombstonePath -TransactionId $id))
+    }
+
     $pattern = ".$($script:ProgramName).retired.*"
     foreach ($item in @(Get-ChildItem -LiteralPath $env:ProgramData -Filter $pattern -Force -ErrorAction Stop)) {
         if ((-not $item.PSIsContainer) -or
@@ -2791,22 +3104,8 @@ function Remove-StaleCleanupTombstones {
 function Complete-RootRetirement {
     param([Parameter(Mandatory = $true)]$Record)
 
-    Assert-OwnedTreeSafeToDelete -Path $script:RootPath
     $id = [string]$Record.transactionId
-    $allowedNames = @(
-        'state.json', 'transaction.json', 'authorized_keys',
-        'ssh-marker.retired', 'ssh-directory.retired',
-        "ssh-marker.$id.tmp", "ssh-directory.$id.tmp",
-        "authorized-keys.$id.staged", "sshd-config.$id.staged",
-        "host-key.$id.ssh_host_ed25519_key.staged",
-        "host-key.$id.ssh_host_ed25519_key.staged.pub",
-        "config-restore.$id.next"
-    )
-    foreach ($child in @(Get-ChildItem -LiteralPath $script:RootPath -Force)) {
-        if ([string]$child.Name -notin $allowedNames) {
-            throw "Protected cleanup root contains an unowned child: $($child.FullName)"
-        }
-    }
+    Assert-CleanupRootReadyForRetirement -Path $script:RootPath -Record $Record
     $savedState = Get-SavedState
     if (($null -ne $savedState) -and ([string]$savedState.transactionId -ne $id)) {
         throw 'Cleanup state belongs to a different transaction.'
@@ -2815,11 +3114,15 @@ function Complete-RootRetirement {
     if (($null -ne $savedTransaction) -and ([string]$savedTransaction.transactionId -ne $id)) {
         throw 'Cleanup transaction belongs to a different install.'
     }
-    $tombstone = Get-CleanupTombstonePath -TransactionId ([string]$Record.transactionId)
-    if (Test-Path -LiteralPath $tombstone) {
-        throw "Cleanup tombstone already exists: $tombstone"
+    $retiring = Get-CleanupRetiringPath -TransactionId $id
+    $tombstone = Get-CleanupTombstonePath -TransactionId $id
+    if ((Test-Path -LiteralPath $retiring) -or (Test-Path -LiteralPath $tombstone)) {
+        throw 'A cleanup retirement path already exists for this transaction.'
     }
-    [IO.Directory]::Move($script:RootPath, $tombstone)
+    [IO.Directory]::Move($script:RootPath, $retiring)
+    $frozenRecord = Get-CleanupRecordFromFrozenRoot -Path $retiring -ExpectedId $id
+    Assert-CleanupRootReadyForRetirement -Path $retiring -Record $frozenRecord
+    [IO.Directory]::Move($retiring, $tombstone)
     Remove-CleanupTombstone -Path $tombstone
 }
 
@@ -2845,7 +3148,7 @@ function Test-ServiceSafeForRestore {
     if (-not (Test-SshdServiceIdentity)) { return $false }
     try {
         $current = Get-ServiceSnapshot
-        return ([string]$current.status -eq 'Stopped') -and
+        return ([string]$current.status -in @('Running', 'Stopped')) -and
             ([string]$current.startType -in @('Automatic', [string]$Snapshot.startType)) -and
             ([string]$current.startName -eq [string]$Snapshot.startName) -and
             ([string]$current.pathName -eq [string]$Snapshot.pathName)
@@ -2972,12 +3275,7 @@ function Assert-CleanupBaselineConverged {
             (Test-InstallPhaseReached -Transaction $Record -Phase 'config')
         $hostKeysWereTouched = ($Kind -eq 'uninstall') -or
             (Test-InstallPhaseReached -Transaction $Record -Phase 'host-keys')
-        if ((-not (Test-Path -LiteralPath $script:SshPath -PathType Container)) -or
-            (Test-ReparsePoint -Path $script:SshPath) -or
-            ((Get-Acl -LiteralPath $script:SshPath).Sddl -ne [string]$Record.original.sshDirectory.sddl) -or
-            ([int](Get-Item -LiteralPath $script:SshPath -Force).Attributes -ne [int]$Record.original.sshDirectory.attributes)) {
-            throw 'The original OpenSSH data directory did not return to its exact baseline.'
-        }
+        Assert-ExistingSshDirectoryUnchanged -Record $Record
         if ($configWasTouched -and (-not (Test-ConfigMatchesSnapshot -Snapshot $Record.original.config))) {
             throw 'The original sshd_config did not return to its exact baseline.'
         }
@@ -2994,6 +3292,9 @@ function Assert-CleanupBaselineConverged {
                 throw 'Retired OpenSSH marker evidence is missing.'
             }
         }
+        if ($boundaryWasOwned -and (Test-Path -LiteralPath (Get-SshOwnershipMarkerPath))) {
+            throw 'The active OpenSSH ownership marker remains after retirement.'
+        }
     } else {
         if (-not $boundaryWasOwned) {
             if (Test-Path -LiteralPath $script:SshPath) {
@@ -3001,18 +3302,18 @@ function Assert-CleanupBaselineConverged {
             }
             return
         }
-        $unclaimedRace = ($Kind -eq 'rollback') -and ([string]$Record.phase -eq 'ssh-directory') -and
-            (Test-Path -LiteralPath $script:SshPath) -and
-            (-not (Test-Path -LiteralPath (Get-SshOwnershipMarkerPath)))
-        if (-not $unclaimedRace) {
+        $retiredDirectory = Get-RetiredSshDirectoryPath
+        $unpublished = ($Kind -eq 'rollback') -and ([string]$Record.phase -eq 'ssh-directory') -and
+            (-not (Test-Path -LiteralPath $script:SshPath)) -and
+            (-not (Test-Path -LiteralPath $retiredDirectory))
+        if (-not $unpublished) {
             if (Test-Path -LiteralPath $script:SshPath) {
                 throw 'The transaction-created OpenSSH data directory remains after cleanup.'
             }
-            $retiredDirectory = Get-RetiredSshDirectoryPath
             if (-not (Test-Path -LiteralPath $retiredDirectory -PathType Container)) {
                 throw 'Retired OpenSSH directory evidence is missing.'
             }
-            Assert-OwnedTreeSafeToDelete -Path $retiredDirectory
+            Assert-NewSshTreeOwned -Path $retiredDirectory -Record $Record -Kind $Kind
         }
     }
 }
@@ -3031,10 +3332,15 @@ function Invoke-OwnedCleanup {
     }
     Initialize-CleanupRecord -Record $Record -Kind $Kind -RemoveCapability $removeCapability
 
-    Enter-CleanupPhase -Record $Record -Kind $Kind -Phase 'service-stop'
     $forwardStopped = ($Kind -eq 'uninstall') -or
         (Test-InstallPhaseReached -Transaction $Record -Phase 'service-stop')
-    if (([string]$Record.cleanupPhase -eq 'service-stop') -and $forwardStopped -and
+    Enter-CleanupPhase -Record $Record -Kind $Kind -Phase 'service-stop'
+    # The forward install sets sshd to Automatic. If Windows restarts during a
+    # later cleanup phase, SCM can start it again. Re-establish the stopped
+    # invariant on every cleanup entry before touching policy, keys, or config.
+    $cleanupCanStillTouchSshInputs = (Get-CleanupPhaseIndex -Phase ([string]$Record.cleanupPhase)) -le
+        (Get-CleanupPhaseIndex -Phase 'service-restore')
+    if ($forwardStopped -and $cleanupCanStillTouchSshInputs -and
         ($null -ne (Get-Service -Name sshd -ErrorAction SilentlyContinue))) {
         Stop-SshdAndWait
     }
@@ -3082,13 +3388,6 @@ function Invoke-OwnedCleanup {
         }
     }
 
-    Enter-CleanupPhase -Record $Record -Kind $Kind -Phase 'ssh-boundary'
-    $forwardBoundary = ($Kind -eq 'uninstall') -or
-        (Test-InstallPhaseReached -Transaction $Record -Phase 'ssh-directory')
-    if (([string]$Record.cleanupPhase -eq 'ssh-boundary') -and $forwardBoundary) {
-        Retire-SshDirectoryBoundary -Record $Record -Kind $Kind
-    }
-
     Enter-CleanupPhase -Record $Record -Kind $Kind -Phase 'capability'
     if ([string]$Record.cleanupPhase -eq 'capability') {
         $forwardCapability = ($Kind -eq 'uninstall') -or
@@ -3102,12 +3401,22 @@ function Invoke-OwnedCleanup {
         Save-CleanupRecord -Record $Record -Kind $Kind
     }
 
+    Enter-CleanupPhase -Record $Record -Kind $Kind -Phase 'ssh-boundary'
+    $forwardBoundary = ($Kind -eq 'uninstall') -or
+        (Test-InstallPhaseReached -Transaction $Record -Phase 'ssh-directory')
+    if (([string]$Record.cleanupPhase -eq 'ssh-boundary') -and $forwardBoundary) {
+        Retire-SshDirectoryBoundary -Record $Record -Kind $Kind
+    }
+
     Enter-CleanupPhase -Record $Record -Kind $Kind -Phase 'config'
     $forwardConfig = ($Kind -eq 'uninstall') -or
         (Test-InstallPhaseReached -Transaction $Record -Phase 'config')
     if (([string]$Record.cleanupPhase -eq 'config') -and
         ($forwardConfig -or ((-not [bool]$Record.original.config.existed) -and $removeCapability))) {
         if (-not (Test-Path -LiteralPath (Get-RetiredSshDirectoryPath))) {
+            if ([bool]$Record.original.sshDirectory.existed) {
+                Assert-ExistingSshDirectoryUnchanged -Record $Record
+            }
             Restore-ConfigSnapshot -Record $Record
         }
     }
@@ -3117,6 +3426,9 @@ function Invoke-OwnedCleanup {
         (Test-InstallPhaseReached -Transaction $Record -Phase 'host-keys')
     if (([string]$Record.cleanupPhase -eq 'host-keys') -and $forwardHostKeys -and
         (-not (Test-Path -LiteralPath (Get-RetiredSshDirectoryPath)))) {
+        if ([bool]$Record.original.sshDirectory.existed) {
+            Assert-ExistingSshDirectoryUnchanged -Record $Record
+        }
         $generated = if ($Kind -eq 'rollback') { @($Record.plannedHostKeyFiles) } else { @($Record.generatedHostKeyFiles) }
         Remove-GeneratedHostKeys -Records $generated
         if (-not (Test-HostKeysMatchSnapshot -Records @($Record.original.hostKeyFiles))) {
@@ -3133,6 +3445,9 @@ function Invoke-OwnedCleanup {
 
     Enter-CleanupPhase -Record $Record -Kind $Kind -Phase 'service-restore'
     if (([string]$Record.cleanupPhase -eq 'service-restore') -and $forwardStopped) {
+        if ([bool]$Record.original.sshDirectory.existed) {
+            Assert-ExistingSshDirectoryUnchanged -Record $Record
+        }
         if (-not (Test-ServiceSafeForRestore -Snapshot $Record.original.service)) {
             throw 'The sshd service changed after cleanup began; refusing to overwrite it.'
         }
@@ -3143,9 +3458,16 @@ function Invoke-OwnedCleanup {
 
     Enter-CleanupPhase -Record $Record -Kind $Kind -Phase 'root-retire'
     if ([string]$Record.cleanupPhase -eq 'root-retire') {
-        if ($forwardBoundary -and [bool]$Record.original.sshDirectory.existed) {
-            Restore-SshDirectorySnapshot -Snapshot $Record.original.sshDirectory
+        if ([bool]$Record.original.sshDirectory.existed) {
+            Assert-ExistingSshDirectoryUnchanged -Record $Record
         }
+        if ($forwardStopped -and (-not (Test-ServiceMatchesSnapshot -Snapshot $Record.original.service))) {
+            if (-not (Test-ServiceSafeForRestore -Snapshot $Record.original.service)) {
+                throw 'The sshd service changed after service restoration; refusing to overwrite it.'
+            }
+            Restore-ServiceSnapshot -Snapshot $Record.original.service
+        }
+        Remove-SshBoundaryStaging -Transaction $Record
         Assert-CleanupBaselineConverged -Record $Record -Kind $Kind
         Complete-RootRetirement -Record $Record
     }
@@ -3284,6 +3606,9 @@ function Install-WindowsRemoteBootstrap {
         if (-not (Test-SshDirectoryBoundary -Record $transaction)) {
             throw 'The protected OpenSSH directory boundary is not intact.'
         }
+        if (-not [bool]$transaction.original.sshDirectory.existed) {
+            Assert-NewSshTreeOwned -Path $script:SshPath -Record $transaction -Kind rollback
+        }
 
         if ([string]$transaction.phase -eq 'ssh-directory') {
             Enter-InstallPhase -Transaction $transaction -Phase 'capability'
@@ -3308,6 +3633,9 @@ function Install-WindowsRemoteBootstrap {
 
         if (-not (Test-SshDirectoryBoundary -Record $transaction)) {
             throw 'OpenSSH capability setup changed the protected data-directory boundary.'
+        }
+        if (-not [bool]$transaction.original.sshDirectory.existed) {
+            Assert-NewSshTreeOwned -Path $script:SshPath -Record $transaction -Kind rollback
         }
 
         $sshdExe = Get-SshdExecutable
@@ -3493,7 +3821,6 @@ function Install-WindowsRemoteBootstrap {
             hostKeyFingerprint = Get-HostKeyFingerprint
             openSshInstalledByTool = [bool]$transaction.capabilityInstalledByTool
             existingSshdTakenOver = [bool]$transaction.takeOverExistingSshd
-            uninstallRemoveCapability = $false
             createdDefaultFirewallSemanticSha256 = [string]$transaction.createdDefaultFirewallSemanticSha256
             generatedHostKeyFiles = @($transaction.generatedHostKeyFiles)
             original = $transaction.original
@@ -3590,6 +3917,16 @@ function Invoke-WindowsRemoteBootstrapAudit {
     Add-AuditCheck 'authorized-keys-acl' (Test-ManagedFileAcl -Path $script:KeyPath) 'SYSTEM and Administrators only'
     Add-AuditCheck 'openssh-directory-boundary' (Test-SshDirectoryBoundary -Record $state) `
         'real directory; parent replacement blocked; marker and baseline/exact ACL intact'
+    $createdSshTreeOk = $true
+    if (-not [bool]$state.original.sshDirectory.existed) {
+        try {
+            Assert-NewSshTreeOwned -Path $script:SshPath -Record $state -Kind audit
+        } catch {
+            $createdSshTreeOk = $false
+        }
+    }
+    Add-AuditCheck 'created-ssh-directory-owned-set' $createdSshTreeOk `
+        'new directory contains only the recorded marker, config, and host keys'
 
     $hostKeysOk = $true
     $hostKeySetOk = $true
@@ -3747,9 +4084,6 @@ function Uninstall-WindowsRemoteBootstrap {
         }
     }
     Assert-StateShape -State $state
-    if ($RemoveOpenSshCapability -and (-not [bool]$state.openSshInstalledByTool)) {
-        throw 'Refusing to remove an OpenSSH capability that this installer did not install.'
-    }
     if ([string]$state.status -eq 'installed') {
         $audit = Invoke-WindowsRemoteBootstrapAudit
         if ([string]$audit.status -ne 'compliant') {

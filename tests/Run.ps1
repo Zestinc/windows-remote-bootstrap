@@ -413,6 +413,128 @@ try {
         Assert-Result $finalAudit 0 'compliant' 'post-tamper repaired audit'
         Assert-Result (Invoke-InstallerRaw -Arguments @('-Mode', 'Uninstall')) 0 'uninstalled' 'recovery-suite uninstall'
         Assert-BaselineExact -Expected $baseline -Context 'recovery suite'
+
+        # Exercise the stronger ownership contract used when ProgramData\ssh did
+        # not exist before installation. Moving the fixture within the same
+        # volume preserves its complete NTFS metadata for exact restoration.
+        $sshFixtureBackup = Join-Path $testRoot 'ssh-existing-fixture'
+        $sshTestLeftover = Join-Path $testRoot 'ssh-test-leftover'
+        $unknownChild = Join-Path $sshRoot 'operator-data.txt'
+        Assert-True (Test-Path -LiteralPath $sshRoot -PathType Container) `
+            'the existing SSH fixture is missing before absent-directory tests'
+        Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
+        [IO.Directory]::Move($sshRoot, $sshFixtureBackup)
+        $absentSshBaseline = Get-Baseline
+        Assert-True (-not [bool]$absentSshBaseline.sshDirectory.existed) `
+            'the absent-directory fixture still has ProgramData\ssh'
+        try {
+            $freshInstall = Invoke-InstallerRaw -Arguments $installArguments
+            Assert-Result $freshInstall 0 'installed' 'absent-directory install'
+            Test-SshSession
+            Assert-Result (Invoke-InstallerRaw -Arguments @('-Mode', 'Audit')) `
+                0 'compliant' 'absent-directory audit'
+            Assert-Result (Invoke-InstallerRaw -Arguments @('-Mode', 'Uninstall')) `
+                0 'uninstalled' 'absent-directory uninstall'
+            Assert-BaselineExact -Expected $absentSshBaseline -Context 'absent-directory uninstall'
+
+            # This hook is intentionally inside Establish-SshDirectoryBoundary,
+            # after the protected candidate exists and immediately before its
+            # atomic publication as ProgramData\ssh.
+            $crashedBeforeRetry = Invoke-InstallerRaw -Arguments $installArguments `
+                -CrashAfter 'ssh-directory-before-publish'
+            Assert-True (($crashedBeforeRetry.ExitCode -ne 0) -and
+                (-not $crashedBeforeRetry.ReceiptExists)) `
+                'pre-publish directory hard crash did not terminate cleanly'
+            $crashTransactionPath = Join-Path $managedRoot 'transaction.json'
+            Assert-True (Test-Path -LiteralPath $crashTransactionPath -PathType Leaf) `
+                'pre-publish directory hard crash lost its transaction'
+            $crashTransaction = Get-Content -LiteralPath $crashTransactionPath -Raw | ConvertFrom-Json
+            Assert-Equal 'ssh-directory' ([string]$crashTransaction.phase) `
+                'pre-publish directory crash transaction phase'
+            $directoryCandidate = Join-Path $managedRoot `
+                "ssh-directory.$([string]$crashTransaction.transactionId).tmp"
+            Assert-True (Test-Path -LiteralPath $directoryCandidate -PathType Container) `
+                'pre-publish directory crash did not preserve the protected candidate'
+            Assert-True (-not (Test-Path -LiteralPath $sshRoot)) `
+                'pre-publish directory crash published ProgramData\ssh prematurely'
+
+            $retryAfterDirectoryCrash = Invoke-InstallerRaw -Arguments $installArguments
+            Assert-Result $retryAfterDirectoryCrash 0 'installed' 'pre-publish directory crash retry'
+            Assert-Result (Invoke-InstallerRaw -Arguments @('-Mode', 'Audit')) `
+                0 'compliant' 'pre-publish directory crash retry audit'
+            Assert-Result (Invoke-InstallerRaw -Arguments @('-Mode', 'Uninstall')) `
+                0 'uninstalled' 'pre-publish directory crash retry uninstall'
+            Assert-BaselineExact -Expected $absentSshBaseline `
+                -Context 'pre-publish directory crash retry cleanup'
+
+            $crashedBeforeUninstall = Invoke-InstallerRaw -Arguments $installArguments `
+                -CrashAfter 'ssh-directory-before-publish'
+            Assert-True (($crashedBeforeUninstall.ExitCode -ne 0) -and
+                (-not $crashedBeforeUninstall.ReceiptExists)) `
+                'second pre-publish directory hard crash did not terminate cleanly'
+            Assert-Result (Invoke-InstallerRaw -Arguments @('-Mode', 'Uninstall')) `
+                0 'rolled-back-incomplete-install' 'pre-publish directory crash direct uninstall'
+            Assert-BaselineExact -Expected $absentSshBaseline `
+                -Context 'pre-publish directory crash direct cleanup'
+
+            Assert-Result (Invoke-InstallerRaw -Arguments $installArguments) `
+                0 'installed' 'new-directory ownership install'
+            [IO.File]::WriteAllText($unknownChild, 'operator-owned sentinel', [Text.Encoding]::UTF8)
+            $unknownChildHash = (Get-FileHash -LiteralPath $unknownChild -Algorithm SHA256).Hash
+
+            $unknownAudit = Invoke-InstallerRaw -Arguments @('-Mode', 'Audit')
+            Assert-Result $unknownAudit 2 'drift' 'unknown SSH child audit'
+            Assert-True (Test-Path -LiteralPath $unknownChild -PathType Leaf) `
+                'audit deleted an unknown SSH child'
+            Assert-Equal $unknownChildHash `
+                (Get-FileHash -LiteralPath $unknownChild -Algorithm SHA256).Hash `
+                'audit changed an unknown SSH child'
+
+            $unknownUninstall = Invoke-InstallerRaw -Arguments @('-Mode', 'Uninstall')
+            Assert-Result $unknownUninstall 1 'failed' 'uninstall with unknown SSH child'
+            Assert-True (Test-Path -LiteralPath $unknownChild -PathType Leaf) `
+                'refused uninstall deleted or relocated an unknown SSH child'
+            Assert-Equal $unknownChildHash `
+                (Get-FileHash -LiteralPath $unknownChild -Algorithm SHA256).Hash `
+                'refused uninstall changed an unknown SSH child'
+
+            Remove-Item -LiteralPath $unknownChild -Force
+            Assert-Result (Invoke-InstallerRaw -Arguments @('-Mode', 'Audit')) `
+                0 'compliant' 'unknown SSH child repair audit'
+            Assert-Result (Invoke-InstallerRaw -Arguments @('-Mode', 'Uninstall')) `
+                0 'uninstalled' 'unknown SSH child repair uninstall'
+            Assert-BaselineExact -Expected $absentSshBaseline `
+                -Context 'new-directory ownership cleanup'
+        } finally {
+            # Preserve runner hygiene even when an assertion exposes a recovery
+            # bug: remove only our sentinel, ask the installer to clean its own
+            # state, then put the untouched original fixture back in place.
+            Remove-Item -LiteralPath $unknownChild -Force -ErrorAction SilentlyContinue
+            try {
+                if ((Test-Path -LiteralPath (Join-Path $managedRoot 'state.json')) -or
+                    (Test-Path -LiteralPath (Join-Path $managedRoot 'transaction.json'))) {
+                    [void](Invoke-InstallerRaw -Arguments @('-Mode', 'Uninstall'))
+                }
+            } catch {
+                Write-Warning "Absent-directory managed cleanup failed: $($_.Exception.Message)"
+            }
+            Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $sshRoot) {
+                Assert-True (-not (Test-Path -LiteralPath $sshTestLeftover)) `
+                    'the absent-directory cleanup quarantine path already exists'
+                [IO.Directory]::Move($sshRoot, $sshTestLeftover)
+            }
+            Assert-True (Test-Path -LiteralPath $sshFixtureBackup -PathType Container) `
+                'the saved existing SSH fixture disappeared'
+            [IO.Directory]::Move($sshFixtureBackup, $sshRoot)
+            Set-Service -Name sshd -StartupType ([string]$baseline.service.startType)
+            if ([string]$baseline.service.status -eq 'Running') {
+                Start-Service -Name sshd
+            } else {
+                Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
+            }
+        }
+        Assert-BaselineExact -Expected $baseline -Context 'restored existing SSH fixture'
     }
 
     Write-Output "Windows $Suite tests passed."
