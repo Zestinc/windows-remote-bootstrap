@@ -169,7 +169,11 @@ function Assert-BaselineExact {
         ($actual | ConvertTo-Json -Depth 10 -Compress) "$Context did not restore the exact baseline"
     Assert-True ($null -eq (Get-LocalUser -Name macremote -ErrorAction SilentlyContinue)) "$Context left the managed account"
     Assert-True ($null -eq (Get-NetFirewallRule -Name $managedRuleName -PolicyStore PersistentStore -ErrorAction SilentlyContinue)) "$Context left the managed firewall rule"
-    Assert-True (-not (Test-Path -LiteralPath $managedRoot)) "$Context left the managed root"
+    $rootDiagnostic = if (Test-Path -LiteralPath $managedRoot) {
+        @((Get-ChildItem -LiteralPath $managedRoot -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }) -join ',')
+    } else { @() }
+    Assert-True (-not (Test-Path -LiteralPath $managedRoot)) `
+        "$Context left the managed root; children=$($rootDiagnostic -join ',')"
 }
 
 function Invoke-InstallerRaw {
@@ -328,6 +332,7 @@ try {
         foreach ($stage in @('account-before-sid-journal', 'service')) {
             $failed = Invoke-InstallerRaw -Arguments $installArguments -ThrowAfter $stage
             Assert-Result $failed 1 'failed' "throw recovery $stage"
+            Write-Output "throw recovery $stage reported: $([string]$failed.Receipt.error)"
             Assert-BaselineExact -Expected $baseline -Context "throw recovery $stage"
         }
 

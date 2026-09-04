@@ -121,7 +121,15 @@ function Write-ProtectedJsonFile {
                 (-not (Test-ManagedFileAcl -Path $Path))) {
                 throw "Protected JSON destination changed identity: $Path"
             }
-            [IO.File]::Replace($temporaryPath, $Path, $null)
+            # PowerShell converts a bare $null passed to a .NET string
+            # parameter into String.Empty. File.Replace then rejects that as
+            # an illegal backup path. NullString.Value preserves a real CLR
+            # null, which the File.Replace contract explicitly supports.
+            [IO.File]::Replace(
+                $temporaryPath,
+                $Path,
+                [System.Management.Automation.Language.NullString]::Value
+            )
         } else {
             [IO.File]::Move($temporaryPath, $Path)
         }
@@ -1260,6 +1268,22 @@ function Get-OptionalPropertyValues {
     return @(ConvertTo-CanonicalStringArray $property.Value)
 }
 
+function Test-ActiveFirewallEnforcementStatus {
+    param([Parameter(Mandatory = $true)]$Rule)
+
+    # NetSecurity's PowerShell adapter uses friendly names (Enforced and
+    # ProfileInactive), while the underlying WMI schema documents the same
+    # values as Full/1 and InactiveProfile/5. A Profile=Any rule normally has
+    # inactive-profile entries beside the enforced active profile. Accept only
+    # those benign representations and require at least one enforced profile.
+    $values = @(Get-OptionalPropertyValues -Object $Rule -Name 'EnforcementStatus' |
+        ForEach-Object { ([string]$_).Trim().ToLowerInvariant() })
+    if ($values.Count -eq 0) { return $false }
+    $allowed = @('enforced', 'full', '1', 'profileinactive', 'inactiveprofile', '5')
+    if (@($values | Where-Object { $_ -notin $allowed }).Count -gt 0) { return $false }
+    return @($values | Where-Object { $_ -in @('enforced', 'full', '1') }).Count -gt 0
+}
+
 function Get-FirewallRuleSemanticSha256 {
     param([Parameter(Mandatory = $true)]$Rule)
 
@@ -1468,9 +1492,7 @@ function Test-ManagedFirewallRule {
         return $false
     }
     if ($PolicyStore -eq 'ActiveStore') {
-        $enforcement = @(Get-OptionalPropertyValues -Object $rule -Name 'EnforcementStatus')
-        if (($enforcement.Count -eq 0) -or
-            (@($enforcement | Where-Object { $_ -notin @('Full', '1') }).Count -gt 0) -or
+        if ((-not (Test-ActiveFirewallEnforcementStatus -Rule $rule)) -or
             ([string]$rule.PolicyStoreSourceType -notin @('Local', '1'))) {
             return $false
         }
@@ -1741,7 +1763,7 @@ function Restore-ConfigSnapshot {
     }
 
     if (Test-Path -LiteralPath $script:SshConfigPath) {
-        $ownedCurrent = Test-ManagedConfigCurrent -Record $Record
+        $ownedCurrent = Test-ManagedConfigContentProtected -Record $Record
         if (($null -ne $Record.PSObject.Properties['preManagedConfig']) -and
             ($null -ne $Record.preManagedConfig)) {
             $ownedCurrent = $ownedCurrent -or (Test-ConfigMatchesSnapshot -Snapshot $Record.preManagedConfig)
@@ -1770,7 +1792,11 @@ function Restore-ConfigSnapshot {
             (Test-ReparsePoint -Path $script:SshConfigPath)) {
             throw 'Refusing to replace an unsafe sshd_config during recovery.'
         }
-        [IO.File]::Replace($temporaryPath, $script:SshConfigPath, $null)
+        [IO.File]::Replace(
+            $temporaryPath,
+            $script:SshConfigPath,
+            [System.Management.Automation.Language.NullString]::Value
+        )
     } else {
         [IO.File]::Move($temporaryPath, $script:SshConfigPath)
     }
@@ -1806,7 +1832,18 @@ function Test-ManagedConfigCurrent {
     return (Test-Path -LiteralPath $script:SshConfigPath -PathType Leaf) -and
         (-not (Test-ReparsePoint -Path $script:SshConfigPath)) -and
         ((Get-FileSha256 -Path $script:SshConfigPath) -eq [string]$Record.managedConfigSha256) -and
-        (Test-ManagedFileAcl -Path $script:SshConfigPath)
+        (Test-ManagedFileAcl -Path $script:SshConfigPath) -and
+        ([int](Get-Item -LiteralPath $script:SshConfigPath -Force).Attributes -eq
+            [int][IO.FileAttributes]::Normal)
+}
+
+function Test-ManagedConfigContentProtected {
+    param([Parameter(Mandatory = $true)]$Record)
+
+    return (Test-Path -LiteralPath $script:SshConfigPath -PathType Leaf) -and
+        (-not (Test-ReparsePoint -Path $script:SshConfigPath)) -and
+        ((Get-FileSha256 -Path $script:SshConfigPath) -eq [string]$Record.managedConfigSha256) -and
+        (Test-PathProtectedFromUntrustedMutation -Path $script:SshConfigPath)
 }
 
 function Restore-SshDirectorySnapshot {
@@ -2562,6 +2599,7 @@ function Assert-InstallTransactionRollbackSafe {
     if (Test-InstallPhaseReached -Transaction $Transaction -Phase 'config') {
         $configAllowed = (Test-ConfigMatchesSnapshot -Snapshot $Transaction.original.config) -or
             (Test-ManagedConfigCurrent -Record $Transaction) -or
+            (Test-ManagedConfigContentProtected -Record $Transaction) -or
             (Test-ConfigMatchesSnapshot -Snapshot $Transaction.preManagedConfig) -or
             (Test-ConfigHasSnapshotContent -Snapshot $Transaction.original.config)
         if (-not (Test-Path -LiteralPath $script:SshConfigPath)) {
@@ -3377,10 +3415,16 @@ function Install-WindowsRemoteBootstrap {
                 }
             }
             if (Test-Path -LiteralPath $script:SshConfigPath) {
-                [IO.File]::Replace($candidatePath, $script:SshConfigPath, $null)
+                [IO.File]::Replace(
+                    $candidatePath,
+                    $script:SshConfigPath,
+                    [System.Management.Automation.Language.NullString]::Value
+                )
             } else {
                 [IO.File]::Move($candidatePath, $script:SshConfigPath)
             }
+            Protect-ManagedFile -Path $script:SshConfigPath
+            [IO.File]::SetAttributes($script:SshConfigPath, [IO.FileAttributes]::Normal)
         } finally {
             if (Test-Path -LiteralPath $candidatePath) {
                 $replacementInterrupted = (Test-InstallPhaseReached -Transaction $transaction -Phase 'config') -and
@@ -3593,7 +3637,7 @@ function Invoke-WindowsRemoteBootstrapAudit {
         try {
             $sshdExe = Get-SshdExecutable
             Test-SshConfig -Path $script:SshConfigPath -SshdExe $sshdExe
-            $configOk = (Get-FileSha256 -Path $script:SshConfigPath) -eq [string]$state.managedConfigSha256
+            $configOk = Test-ManagedConfigCurrent -Record $state
             $configAclOk = Test-ManagedFileAcl -Path $script:SshConfigPath
             $policyOk = Test-EffectiveSshPolicy -Path $script:SshConfigPath -SshdExe $sshdExe `
                 -Name ([string]$state.accountName) -SshPort ([int]$state.port)
