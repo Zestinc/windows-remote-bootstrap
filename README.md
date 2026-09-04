@@ -1,11 +1,5 @@
 # Windows Remote Bootstrap
 
-> **Development status:** v1.0.0 has not been released. The hash placeholders
-> below are intentionally non-executable. Do not use the install commands until
-> the exact release commit passes every Windows CI job, the placeholders are
-> replaced, and the immutable GitHub Release is published and independently
-> verified.
-
 A dependency-free Windows PowerShell 5.1 bootstrapper for secure administration
 from macOS. It installs the in-box Windows OpenSSH Server when needed, creates
 one dedicated local administrator, accepts only the supplied public keys, and
@@ -48,7 +42,7 @@ UTF-8, and executes only the verified script in memory.
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $uri = 'https://github.com/Zestinc/windows-remote-bootstrap/releases/download/v1.0.0/install.ps1'
-$expected = '__FINAL_INSTALL_SHA256__'
+$expected = '4d282c9eb8cc4a9b857aa43bb819165e412eca710e0a8d688968b9957f49b41f'
 $keys = @(
     'c3NoLWVkMjU1MTkgQUFBQUMzTnphQzFsWkRJMU5URTVBQUFBSUdSVTVWWi9nalJhZUpyNnRlNzlseEhPM3lzeWFaWDVDcUZkZ3EybEI1Zk0gbWFjbWluaS0yMDI2',
     'c3NoLWVkMjU1MTkgQUFBQUMzTnphQzFsWkRJMU5URTVBQUFBSUVJZWMrRTlSazRqSzd2KytTUGR1QVF6Y296cGh5bnI5eGRwUjNFRGRkdDUgbWJwLTIwMjY='
@@ -141,7 +135,7 @@ It deliberately keeps first-connection host-key verification enabled.
     --proto '=https' --proto-redir '=https' --tlsv1.2 \
     -o "$wrb_tmp/winctl" \
     https://github.com/Zestinc/windows-remote-bootstrap/releases/download/v1.0.0/winctl
-  printf '%s  %s\n' '__FINAL_WINCTL_SHA256__' "$wrb_tmp/winctl" | shasum -a 256 -c -
+  printf '%s  %s\n' '8af8e301b44aec7f45629b4f020ffd89fd31e36835422d478df969330eaf2ba4' "$wrb_tmp/winctl" | shasum -a 256 -c -
   mkdir -p "$HOME/.local/bin"
   install -m 700 "$wrb_tmp/winctl" "$HOME/.local/bin/winctl"
 )

@@ -35,6 +35,6 @@ for reading and changing Windows display and sleep timeouts.
 
 ## Current state
 
-v1.0.0 is unreleased. README hash placeholders are deliberate until an exact
-commit passes the complete matrix and its release assets are independently
-downloaded and verified.
+v1.0.0 is released. `README.md` and `SHA256SUMS` carry the frozen v1.0.0
+asset hashes; any change to `install.ps1` or `winctl` requires a new
+versioned release and updated hashes, never a rewrite of v1.0.0 assets.
