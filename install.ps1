@@ -862,6 +862,14 @@ function Invoke-WindowsRemoteBootstrapAudit {
     Add-AuditCheck 'authorized-keys-acl' (Test-ManagedFileAcl -Path $script:KeyPath) 'SYSTEM and Administrators only'
     Add-AuditCheck 'state-acl' (Test-ManagedFileAcl -Path $script:StatePath) 'SYSTEM and Administrators only'
 
+    $hostKeysOk = $true
+    try {
+        Assert-OpenSshHostKeysProtected
+    } catch {
+        $hostKeysOk = $false
+    }
+    Add-AuditCheck 'ssh-host-key-acls' $hostKeysOk 'private host keys: SYSTEM and Administrators only'
+
     $configOk = $false
     $policyOk = $false
     if (Test-Path -LiteralPath $script:SshConfigPath) {
@@ -899,7 +907,7 @@ function Invoke-WindowsRemoteBootstrapAudit {
     $defaultRuleOk = ($null -eq $defaultRule) -or ([string]$defaultRule.Enabled -ne 'True')
     Add-AuditCheck 'default-wide-firewall-disabled' $defaultRuleOk $(if ($null -eq $defaultRule) { 'absent' } else { [string]$defaultRule.Enabled })
 
-    $allOk = ($checks | Where-Object { -not $_.ok }).Count -eq 0
+    $allOk = @($checks | Where-Object { -not $_.ok }).Count -eq 0
     return [ordered]@{
         status = if ($allOk) { 'compliant' } else { 'drift' }
         installerVersion = $script:InstallerVersion
