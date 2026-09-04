@@ -312,7 +312,7 @@ function Ensure-LocalAccount {
             $securePassword = ConvertTo-SecureString $plainPassword -AsPlainText -Force
             $existing = New-LocalUser -Name $Name -Password $securePassword `
                 -AccountNeverExpires -PasswordNeverExpires -UserMayNotChangePassword `
-                -Description 'Key-only account managed by WindowsRemoteBootstrap'
+                -Description 'Key-only SSH account'
         } finally {
             $plainPassword = $null
             $securePassword = $null
