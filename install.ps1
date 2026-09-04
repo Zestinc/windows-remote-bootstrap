@@ -503,7 +503,7 @@ function Test-RawFileSystemAllowAces {
         if (Test-TrustedSidForSecurityBoundary -Sid $sid -FixedTrustedOnly $FixedTrustedOnly) {
             continue
         }
-        $mask = ConvertTo-UnsignedAccessMask -AccessMask ([int]$ace.AccessMask)
+        $mask = ConvertTo-UnsignedAccessMask -AccessMask $ace.AccessMask
         if (($mask -band $UnsafeMask) -ne 0) {
             $script:LastSecurityBoundaryError = ('untrusted allow ACE SID={0} mask=0x{1:x8}' -f $sid, $mask)
             return $false
@@ -545,7 +545,7 @@ function Test-PathProtectedFromUntrustedMutation {
         return Test-RawFileSystemAllowAces -Descriptor $raw -UnsafeMask $unsafeMask `
             -FixedTrustedOnly $FixedTrustedOnly
     } catch {
-        $script:LastSecurityBoundaryError = "ACL query failed for '$Path': $($_.Exception.Message)"
+        $script:LastSecurityBoundaryError = "ACL query failed for '$Path': $($_.Exception.Message); $($_.ScriptStackTrace)"
         return $false
     }
 }
@@ -579,7 +579,7 @@ function Test-ParentProtectsChildFromUntrustedReplacement {
         return Test-RawFileSystemAllowAces -Descriptor $raw `
             -UnsafeMask $unsafeReplacementMask -FixedTrustedOnly $FixedTrustedOnly
     } catch {
-        $script:LastSecurityBoundaryError = "ACL query failed for '$parent': $($_.Exception.Message)"
+        $script:LastSecurityBoundaryError = "ACL query failed for '$parent': $($_.Exception.Message); $($_.ScriptStackTrace)"
         return $false
     }
 }
@@ -2190,7 +2190,7 @@ function Test-SshdServiceObjectSecurity {
             if ($ace.AceQualifier -ne [Security.AccessControl.AceQualifier]::AccessAllowed) { return $false }
             $sid = [string]$ace.SecurityIdentifier.Value
             if (Test-FixedTrustedSystemSid -Sid $sid) { continue }
-            $mask = ConvertTo-UnsignedAccessMask -AccessMask ([int]$ace.AccessMask)
+            $mask = ConvertTo-UnsignedAccessMask -AccessMask $ace.AccessMask
             if (($mask -band $unsafeForUntrusted) -ne 0) { return $false }
         }
         return $true
