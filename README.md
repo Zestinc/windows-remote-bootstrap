@@ -24,7 +24,17 @@ Use a versioned GitHub Release asset and verify its documented SHA-256 before
 execution. Pass each macOS public key as Base64-encoded UTF-8 and set the exact
 LAN, host IPs, or `LocalSubnet` that may connect.
 
-The release command is added here after CI has validated the release artifact.
+Example (replace the placeholder with a Base64-encoded public key):
+
+```powershell
+$url = 'https://github.com/Zestinc/windows-remote-bootstrap/releases/download/v1.0.0/install.ps1'
+$path = Join-Path $env:TEMP 'windows-remote-bootstrap-v1.0.0.ps1'
+Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $path
+$actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+$expected = '3623989524e1a48cc87f7083eb2a0daf221c63f18f9e3100a19315f4d3c10aa6'
+if ($actual -ne $expected) { Remove-Item $path -Force; throw "SHA-256 mismatch: $actual" }
+& $path -AuthorizedKeyBase64 '<BASE64_PUBLIC_KEY>' -AllowedRemoteAddress 'LocalSubnet'
+```
 
 The installer is idempotent. If OpenSSH Server was already configured by
 something else, it refuses to replace that access policy unless
