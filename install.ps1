@@ -447,7 +447,7 @@ function Test-ManagedPolicyText {
 
     # The dedicated user Match must be the first active Match block. OpenSSH uses
     # the first matching value, so the later Windows administrator-group default
-    # cannot redirect this account to administrators_authorized_keys.
+    # cannot redirect this account to Windows' shared administrator key file.
     $firstMatch = [regex]::Match($Text, '(?im)^\s*Match\s+')
     return $firstMatch.Success -and ($firstMatch.Index -ge $userMatch.Index) -and ($firstMatch.Index -lt ($userMatch.Index + $userMatch.Length))
 }
