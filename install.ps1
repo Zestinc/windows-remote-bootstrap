@@ -1272,7 +1272,7 @@ function Test-ProtectedSystemExecutable {
 function Get-SshdExecutable {
     $candidate = Join-Path $script:SystemPath 'OpenSSH\sshd.exe'
     if (-not (Test-ProtectedSystemExecutable -Path $candidate)) {
-        throw "OpenSSH Server executable is missing or has an unsafe path/ACL: $candidate"
+        throw "OpenSSH Server executable is missing or has an unsafe path/ACL: $candidate; $script:LastSecurityBoundaryError"
     }
     return $candidate
 }
@@ -1280,7 +1280,7 @@ function Get-SshdExecutable {
 function Get-SshKeygenExecutable {
     $candidate = Join-Path $script:SystemPath 'OpenSSH\ssh-keygen.exe'
     if (-not (Test-ProtectedSystemExecutable -Path $candidate)) {
-        throw "OpenSSH key utility is missing or has an unsafe path/ACL: $candidate"
+        throw "OpenSSH key utility is missing or has an unsafe path/ACL: $candidate; $script:LastSecurityBoundaryError"
     }
     return $candidate
 }
