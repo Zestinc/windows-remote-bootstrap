@@ -4,6 +4,7 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $installer = Join-Path $repoRoot 'install.ps1'
 $text = Get-Content -LiteralPath $installer -Raw
+$winctlText = Get-Content -LiteralPath (Join-Path $repoRoot 'winctl') -Raw
 
 $required = @(
     "PasswordAuthentication no",
@@ -45,8 +46,23 @@ foreach ($needle in $forbidden) {
 if ($text -match '(?m)\[IO\.File\]::Replace\([^\r\n]*,\s*\$null\s*\)') {
     throw 'File.Replace must use AutomationNull, not a PowerShell null argument.'
 }
-if ($text -match '(?m)\(Get-OptionalPropertyValues[^\r\n]*\)\.Count') {
+if ($text -match '(?m)(?<!@)\(Get-OptionalPropertyValues[^\r\n]*\)\.Count') {
     throw 'Optional property values must be array-wrapped before reading Count in PowerShell 5.1.'
+}
+
+foreach ($needle in @(
+        '-o BatchMode=no',
+        '-o StrictHostKeyChecking=ask',
+        '$values[$values.Count - 2]',
+        '$values[$values.Count - 1]',
+        'powercfg update did not converge to the requested values'
+    )) {
+    if (-not $winctlText.Contains($needle)) {
+        throw "macOS control helper is missing a required safety check: $needle"
+    }
+}
+if ($winctlText.Contains('-o BatchMode=yes')) {
+    throw 'macOS control helper must permit first-connection host-key confirmation.'
 }
 
 Write-Output 'Static security tests passed.'

@@ -4,9 +4,9 @@ set -eu
 usage() {
   cat <<'EOF'
 Usage:
-  winctl [--user USER] [--port PORT] [--identity KEY] HOST status
-  winctl [--user USER] [--port PORT] [--identity KEY] HOST display AC_MINUTES [DC_MINUTES]
-  winctl [--user USER] [--port PORT] [--identity KEY] HOST sleep AC_MINUTES [DC_MINUTES]
+  winctl [--user USER] [--port PORT] [--identity KEY] [--known-hosts FILE] HOST status
+  winctl [--user USER] [--port PORT] [--identity KEY] [--known-hosts FILE] HOST display AC_MINUTES [DC_MINUTES]
+  winctl [--user USER] [--port PORT] [--identity KEY] [--known-hosts FILE] HOST sleep AC_MINUTES [DC_MINUTES]
 
 The first connection deliberately asks you to verify the Windows SSH host key.
 EOF
@@ -15,6 +15,7 @@ EOF
 remote_user=macremote
 remote_port=22
 identity_file=
+known_hosts_file=
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -31,6 +32,11 @@ while [ "$#" -gt 0 ]; do
     --identity)
       [ "$#" -ge 2 ] || { usage >&2; exit 64; }
       identity_file=$2
+      shift 2
+      ;;
+    --known-hosts)
+      [ "$#" -ge 2 ] || { usage >&2; exit 64; }
+      known_hosts_file=$2
       shift 2
       ;;
     -h|--help)
@@ -64,7 +70,7 @@ is_minutes() {
   [ "$1" -le 1440 ]
 }
 
-power_query_function='function Get-PowerValue([string]$SubGroup,[string]$Setting) { $text = (& powercfg.exe /query SCHEME_CURRENT $SubGroup $Setting 2>&1 | Out-String); if ($LASTEXITCODE -ne 0) { throw $text.Trim() }; $values = @([regex]::Matches($text, "0x([0-9a-fA-F]{8})") | ForEach-Object { [Convert]::ToInt64($_.Groups[1].Value, 16) }); [ordered]@{ acSeconds = $(if ($values.Count -gt 0) { $values[0] } else { $null }); dcSeconds = $(if ($values.Count -gt 1) { $values[1] } else { $null }) } }'
+power_query_function='function Get-PowerValue([string]$SubGroup,[string]$Setting) { $text = (& powercfg.exe /query SCHEME_CURRENT $SubGroup $Setting 2>&1 | Out-String); if ($LASTEXITCODE -ne 0) { throw $text.Trim() }; $values = @([regex]::Matches($text, "0x([0-9a-fA-F]{8})") | ForEach-Object { [Convert]::ToInt64($_.Groups[1].Value, 16) }); if ($values.Count -lt 2) { throw "powercfg did not return current AC/DC values" }; [ordered]@{ acSeconds = $values[$values.Count - 2]; dcSeconds = $values[$values.Count - 1] } }'
 
 case "$action" in
   status)
@@ -88,7 +94,7 @@ case "$action" in
       subgroup=SUB_SLEEP
       setting=STANDBYIDLE
     fi
-    remote_script="$power_query_function; & powercfg.exe /change '$ac_setting' $ac_minutes; if (\$LASTEXITCODE -ne 0) { throw 'powercfg AC update failed' }; & powercfg.exe /change '$dc_setting' $dc_minutes; if (\$LASTEXITCODE -ne 0) { throw 'powercfg DC update failed' }; [ordered]@{ status = 'updated'; setting = '$action'; requestedAcMinutes = $ac_minutes; requestedDcMinutes = $dc_minutes; effective = Get-PowerValue '$subgroup' '$setting' } | ConvertTo-Json -Depth 4"
+    remote_script="$power_query_function; & powercfg.exe /change '$ac_setting' $ac_minutes; if (\$LASTEXITCODE -ne 0) { throw 'powercfg AC update failed' }; & powercfg.exe /change '$dc_setting' $dc_minutes; if (\$LASTEXITCODE -ne 0) { throw 'powercfg DC update failed' }; \$effective = Get-PowerValue '$subgroup' '$setting'; if (([int64]\$effective.acSeconds -ne ([int64]$ac_minutes * 60)) -or ([int64]\$effective.dcSeconds -ne ([int64]$dc_minutes * 60))) { throw 'powercfg update did not converge to the requested values' }; [ordered]@{ status = 'updated'; setting = '$action'; requestedAcMinutes = $ac_minutes; requestedDcMinutes = $dc_minutes; effective = \$effective } | ConvertTo-Json -Depth 4"
     ;;
   *)
     printf 'Unknown action: %s\n' "$action" >&2
@@ -101,12 +107,16 @@ encoded_command=$(printf '%s' "$remote_script" | iconv -f UTF-8 -t UTF-16LE | ba
 
 set -- \
   -p "$remote_port" \
-  -o BatchMode=yes \
+  -o BatchMode=no \
+  -o StrictHostKeyChecking=ask \
   -o PasswordAuthentication=no \
   -o PreferredAuthentications=publickey
 
 if [ -n "$identity_file" ]; then
   set -- "$@" -o IdentitiesOnly=yes -i "$identity_file"
+fi
+if [ -n "$known_hosts_file" ]; then
+  set -- "$@" -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts_file"
 fi
 
 exec ssh "$@" "$remote_user@$remote_host" \

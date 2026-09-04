@@ -10,10 +10,12 @@ Set-StrictMode -Version 2.0
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $installer = Join-Path $repoRoot 'install.ps1'
+$winctl = Join-Path $repoRoot 'winctl'
 $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $sshRoot = Join-Path $env:ProgramData 'ssh'
 $configPath = Join-Path $sshRoot 'sshd_config'
 $managedRoot = Join-Path $env:ProgramData 'WindowsRemoteBootstrap'
+$cleanupRoot = Join-Path $env:ProgramData '.WindowsRemoteBootstrap.cleanup'
 $receiptPath = Join-Path $env:PUBLIC 'Documents\WindowsRemoteBootstrap-receipt.json'
 $managedRuleName = 'WindowsRemoteBootstrap-SSH-In'
 $testRoot = Join-Path $env:TEMP ("WindowsRemoteBootstrapTests-$([Guid]::NewGuid().ToString('N'))")
@@ -95,6 +97,7 @@ function Get-PathSnapshot {
 }
 
 function Get-HostKeySnapshots {
+    if (-not (Test-Path -LiteralPath $sshRoot -PathType Container)) { return @() }
     return @(Get-ChildItem -LiteralPath $sshRoot -Filter 'ssh_host_*' -Force -ErrorAction Stop |
         Sort-Object Name | ForEach-Object {
             if ($_.PSIsContainer) { throw "Unexpected host-key directory: $($_.FullName)" }
@@ -108,9 +111,21 @@ function Get-HostKeySnapshots {
 }
 
 function Get-ServiceTestSnapshot {
-    $service = Get-Service -Name sshd
-    $cim = Get-CimInstance -ClassName Win32_Service -Filter "Name='sshd'"
+    $cimServices = @(Get-CimInstance -ClassName Win32_Service -Filter "Name='sshd'" -ErrorAction Stop)
+    if ($cimServices.Count -eq 0) {
+        return [ordered]@{
+            existed = $false
+            status = $null
+            startType = $null
+            startName = $null
+            pathName = $null
+        }
+    }
+    Assert-True ($cimServices.Count -eq 1) 'test fixture found an ambiguous sshd service'
+    $service = Get-Service -Name sshd -ErrorAction Stop
+    $cim = $cimServices[0]
     return [ordered]@{
+        existed = $true
         status = [string]$service.Status
         startType = [string]$service.StartType
         startName = [string]$cim.StartName
@@ -174,10 +189,8 @@ function Assert-BaselineExact {
     } else { @() }
     Assert-True (-not (Test-Path -LiteralPath $managedRoot)) `
         "$Context left the managed root; children=$($rootDiagnostic -join ',')"
-    $cleanupRoots = @(Get-ChildItem -LiteralPath $env:ProgramData `
-            -Filter '.WindowsRemoteBootstrap.ret*' -Force -ErrorAction Stop)
-    Assert-True ($cleanupRoots.Count -eq 0) `
-        "$Context left cleanup roots: $(@($cleanupRoots | ForEach-Object { $_.Name }) -join ',')"
+    Assert-True (-not (Test-Path -LiteralPath $cleanupRoot)) `
+        "$Context left the protected cleanup root"
 }
 
 function Invoke-InstallerRaw {
@@ -226,13 +239,82 @@ function Assert-AuditCheck {
     Assert-Equal $Expected ([bool]$check[0].ok) "Audit check '$Name'"
 }
 
+function ConvertTo-MsysPath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    if ($fullPath -notmatch '^([A-Za-z]):\\(.*)$') {
+        throw "Cannot convert a non-drive path for Git Bash: $fullPath"
+    }
+    return "/$(([string]$Matches[1]).ToLowerInvariant())/$(([string]$Matches[2]).Replace('\', '/'))"
+}
+
+function Write-TestKnownHosts {
+    $publicHostKey = Get-Content -LiteralPath (Join-Path $sshRoot 'ssh_host_ed25519_key.pub') -Raw
+    $parts = @($publicHostKey.Trim() -split '\s+')
+    Assert-True ($parts.Count -ge 2) 'managed host public key is malformed'
+    [IO.File]::WriteAllText(
+        $knownHosts,
+        "[127.0.0.1]:$testPort $($parts[0]) $($parts[1])`n",
+        (New-Object Text.UTF8Encoding($false))
+    )
+}
+
+function Get-TestPowerValue {
+    param([string]$SubGroup, [string]$Setting)
+    $text = (& powercfg.exe /query SCHEME_CURRENT $SubGroup $Setting 2>&1 | Out-String)
+    Assert-True ($LASTEXITCODE -eq 0) "powercfg query failed: $text"
+    $values = @([regex]::Matches($text, '0x([0-9a-fA-F]{8})') | ForEach-Object {
+            [Convert]::ToInt64($_.Groups[1].Value, 16)
+        })
+    Assert-True ($values.Count -ge 2) 'powercfg query did not expose current AC/DC values'
+    return [pscustomobject]@{
+        AcSeconds = [int64]$values[$values.Count - 2]
+        DcSeconds = [int64]$values[$values.Count - 1]
+    }
+}
+
+function Test-WinctlPowerControl {
+    $bash = Join-Path $env:ProgramFiles 'Git\bin\bash.exe'
+    Assert-True (Test-Path -LiteralPath $bash -PathType Leaf) 'Git Bash is unavailable for the macOS helper test'
+    $before = Get-TestPowerValue -SubGroup 'SUB_VIDEO' -Setting 'VIDEOIDLE'
+    try {
+        $previousErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $output = @(& $bash (ConvertTo-MsysPath -Path $winctl) `
+                    '--identity' (ConvertTo-MsysPath -Path $clientKey) `
+                    '--known-hosts' (ConvertTo-MsysPath -Path $knownHosts) `
+                    '--port' ([string]$testPort) '127.0.0.1' 'display' '17' '19' 2>&1)
+            $winctlExitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
+        Assert-True ($winctlExitCode -eq 0) "winctl failed: $($output -join ' ')"
+        $receipt = ($output -join "`n") | ConvertFrom-Json
+        Assert-Equal 'updated' ([string]$receipt.status) 'winctl update status'
+        Assert-Equal 1020 ([int64]$receipt.effective.acSeconds) 'winctl AC display readback'
+        Assert-Equal 1140 ([int64]$receipt.effective.dcSeconds) 'winctl DC display readback'
+        $actual = Get-TestPowerValue -SubGroup 'SUB_VIDEO' -Setting 'VIDEOIDLE'
+        Assert-Equal 1020 $actual.AcSeconds 'system AC display setting after winctl'
+        Assert-Equal 1140 $actual.DcSeconds 'system DC display setting after winctl'
+    } finally {
+        & powercfg.exe /setacvalueindex SCHEME_CURRENT SUB_VIDEO VIDEOIDLE ([string]$before.AcSeconds) | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'failed to restore the AC display timeout after winctl test' }
+        & powercfg.exe /setdcvalueindex SCHEME_CURRENT SUB_VIDEO VIDEOIDLE ([string]$before.DcSeconds) | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'failed to restore the DC display timeout after winctl test' }
+        & powercfg.exe /setactive SCHEME_CURRENT | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'failed to reactivate the original power scheme after winctl test' }
+    }
+}
+
 function Test-SshSession {
+    Write-TestKnownHosts
     $ssh = Join-Path $env:SystemRoot 'System32\OpenSSH\ssh.exe'
     $arguments = @(
         '-p', [string]$testPort, '-i', $clientKey,
         '-o', 'BatchMode=yes', '-o', 'PasswordAuthentication=no',
         '-o', 'IdentitiesOnly=yes', '-o', 'LogLevel=ERROR',
-        '-o', 'StrictHostKeyChecking=no', '-o', "UserKnownHostsFile=$knownHosts",
+        '-o', 'StrictHostKeyChecking=yes', '-o', "UserKnownHostsFile=$knownHosts",
         'macremote@127.0.0.1'
     )
     $identity = @(& $ssh @arguments 'whoami.exe' 2>&1)
@@ -310,6 +392,7 @@ Match User legacy-user
     Assert-True ($null -eq (Get-LocalUser -Name macremote -ErrorAction SilentlyContinue)) 'fixture started with macremote account'
     Assert-True ($null -eq (Get-NetFirewallRule -Name $managedRuleName -PolicyStore PersistentStore -ErrorAction SilentlyContinue)) 'fixture started with managed rule'
     Assert-True (-not (Test-Path -LiteralPath $managedRoot)) 'fixture started with managed state'
+    Assert-True (-not (Test-Path -LiteralPath $cleanupRoot)) 'fixture started with managed cleanup state'
 }
 
 [void](New-Item -Path $testRoot -ItemType Directory -Force)
@@ -336,6 +419,7 @@ try {
         Assert-True (-not $config.Contains('Match ')) 'managed config preserved a Match block'
         Assert-True (-not $config.Contains('Include ')) 'managed config preserved an Include directive'
         Test-SshSession
+        Test-WinctlPowerControl
 
         $audit = Invoke-InstallerRaw -Arguments @('-Mode', 'Audit')
         Assert-Result $audit 0 'compliant' 'smoke audit'
@@ -351,7 +435,11 @@ try {
             Assert-BaselineExact -Expected $baseline -Context "throw recovery $stage"
         }
 
-        foreach ($retirementStage in @('cleanup-root-after-freeze', 'cleanup-root-after-commit')) {
+        foreach ($retirementStage in @(
+                'cleanup-root-after-freeze',
+                'cleanup-root-after-commit',
+                'cleanup-tombstone-partial'
+            )) {
             # Combine a normal injected forward failure with a hard kill during
             # rollback. The next process must recognize either the frozen root
             # or committed tombstone and finish cleanup without guessing.
@@ -462,8 +550,13 @@ try {
             Test-SshSession
             Assert-Result (Invoke-InstallerRaw -Arguments @('-Mode', 'Audit')) `
                 0 'compliant' 'absent-directory audit'
+            $newDirectoryRetirement = Invoke-InstallerRaw -Arguments @('-Mode', 'Uninstall') `
+                -CrashAfter 'cleanup-root-after-freeze'
+            Assert-True (($newDirectoryRetirement.ExitCode -ne 0) -and
+                (-not $newDirectoryRetirement.ReceiptExists)) `
+                'new-directory cleanup freeze did not hard crash'
             Assert-Result (Invoke-InstallerRaw -Arguments @('-Mode', 'Uninstall')) `
-                0 'uninstalled' 'absent-directory uninstall'
+                0 'already-uninstalled' 'new-directory frozen cleanup retry'
             Assert-BaselineExact -Expected $absentSshBaseline -Context 'absent-directory uninstall'
 
             # This hook is intentionally inside Establish-SshDirectoryBoundary,
@@ -564,6 +657,37 @@ try {
             }
         }
         Assert-BaselineExact -Expected $baseline -Context 'restored existing SSH fixture'
+
+        # Last, turn the ephemeral runner into a genuinely dependency-free
+        # baseline. This proves the installer—not the fixture—adds OpenSSH, and
+        # that exact uninstall removes only the capability it claimed.
+        Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
+        $removeCapability = Remove-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0'
+        $removedCapability = Get-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0'
+        Assert-True ((-not $removeCapability.RestartNeeded) -and
+            ([string]$removedCapability.State -eq 'NotPresent')) `
+            "runner could not reach a restart-free NotPresent dependency baseline: $($removedCapability.State)"
+        Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -PolicyStore PersistentStore `
+            -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction Stop
+        if (Test-Path -LiteralPath $sshRoot) {
+            $dependencySshBackup = Join-Path $testRoot 'dependency-ssh-leftover'
+            [IO.Directory]::Move($sshRoot, $dependencySshBackup)
+        }
+        $dependencyBaseline = Get-Baseline
+        Assert-Equal 'NotPresent' ([string]$dependencyBaseline.capability) 'dependency baseline capability'
+        Assert-True (-not [bool]$dependencyBaseline.service.existed) 'dependency baseline still has sshd'
+        Assert-True (-not [bool]$dependencyBaseline.sshDirectory.existed) 'dependency baseline still has ProgramData\ssh'
+
+        $dependencyInstall = Invoke-InstallerRaw -Arguments $installArguments
+        Assert-Result $dependencyInstall 0 'installed' 'automatic OpenSSH dependency install'
+        Assert-True ([bool]$dependencyInstall.Receipt.openSsh.installedByThisTool) `
+            'automatic dependency install was not recorded as installer-owned'
+        Test-SshSession
+        Assert-Result (Invoke-InstallerRaw -Arguments @('-Mode', 'Audit')) `
+            0 'compliant' 'automatic dependency audit'
+        Assert-Result (Invoke-InstallerRaw -Arguments @('-Mode', 'Uninstall')) `
+            0 'uninstalled' 'automatic dependency uninstall'
+        Assert-BaselineExact -Expected $dependencyBaseline -Context 'automatic dependency uninstall'
     }
 
     Write-Output "Windows $Suite tests passed."
