@@ -2128,7 +2128,7 @@ namespace WindowsRemoteBootstrap
         private static extern bool QueryServiceObjectSecurity(
             IntPtr service,
             uint securityInformation,
-            byte[] securityDescriptor,
+            [Out] byte[] securityDescriptor,
             uint bufferSize,
             out uint bytesNeeded);
 
