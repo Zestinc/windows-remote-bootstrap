@@ -590,7 +590,8 @@ function Test-ProtectedPathIdentityChain {
 
     try {
         $current = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
-        while ($null -ne $current.Parent) {
+        $parent = if ($current -is [IO.FileInfo]) { $current.Directory } else { $current.Parent }
+        while ($null -ne $parent) {
             $acl = Get-Acl -LiteralPath $current.FullName -ErrorAction Stop
             $raw = New-Object -TypeName Security.AccessControl.RawSecurityDescriptor `
                 -ArgumentList (,$acl.Sddl)
@@ -610,7 +611,8 @@ function Test-ProtectedPathIdentityChain {
                     -ChildPath $current.FullName -FixedTrustedOnly $true)) {
                 return $false
             }
-            $current = $current.Parent
+            $current = $parent
+            $parent = $current.Parent
         }
         return $true
     } catch {
@@ -898,7 +900,7 @@ function Assert-NoReparseAncestors {
         if (($current.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
             throw "A canonical Windows path traverses a reparse point: $($current.FullName)"
         }
-        $current = $current.Parent
+        $current = if ($current -is [IO.FileInfo]) { $current.Directory } else { $current.Parent }
     }
 }
 
